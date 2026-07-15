@@ -1,0 +1,6 @@
+.env
+data/
+sing-box/config.json
+sing-box/*.key
+sing-box/*.pem
+*.log
