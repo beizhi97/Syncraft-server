@@ -227,26 +227,20 @@ export function assertServerHealthResponseContract(response, label = "serverHeal
   assertNoRawDiagnosticSecrets(response, label);
 }
 
+// The unauthenticated health probe must stay limited to liveness/readiness.
+// Device and bucket counts are deliberately absent: exposing operational scale
+// to anonymous callers is needless disclosure, and no consumer read them.
 function assertServerServiceHealthContract(serviceHealth, label = "serviceHealth") {
   assertObject(serviceHealth, label);
   assertExactKeys(serviceHealth, [
-    "activeBucketCount",
     "apiReachable",
-    "bucketCount",
-    "enabledDeviceCount",
     "ok",
-    "onlineDeviceCount",
     "restartRequired"
   ], label);
   assertEqual(typeof serviceHealth.ok, "boolean", `${label}.ok`);
   assertEqual(serviceHealth.apiReachable, true, `${label}.apiReachable`);
   assertEqual(typeof serviceHealth.restartRequired, "boolean", `${label}.restartRequired`);
   assertEqual(serviceHealth.ok, !serviceHealth.restartRequired, `${label}.ok`);
-  for (const field of ["enabledDeviceCount", "onlineDeviceCount", "bucketCount", "activeBucketCount"]) {
-    assertNonNegativeInteger(serviceHealth[field], `${label}.${field}`);
-  }
-  assert(serviceHealth.onlineDeviceCount <= serviceHealth.enabledDeviceCount, `${label}.onlineDeviceCount`);
-  assert(serviceHealth.activeBucketCount <= serviceHealth.bucketCount, `${label}.activeBucketCount`);
 }
 
 export function assertAdminAuthCheckResponseContract(response, label = "adminAuthCheck") {
@@ -1111,10 +1105,21 @@ export function assertRclonePreviewContract(rclone, label = "rclone", options = 
   assertObject(rclone.remoteConfig, `${label}.remoteConfig`);
   assertNonEmptyString(rclone.remoteConfig.executable, `${label}.remoteConfig.executable`);
   assertArray(rclone.remoteConfig.args, `${label}.remoteConfig.args`);
+  assertObject(rclone.remoteConfig.env, `${label}.remoteConfig.env`);
   assertNonEmptyString(rclone.remoteConfig.displayCommand, `${label}.remoteConfig.displayCommand`);
   assertPreviewDisplayTextIsSafe(rclone.remoteConfig.displayCommand, `${label}.remoteConfig.displayCommand`, options);
-  if (rclone.remoteConfig.displayCommand.includes("secret_access_key")) {
-    assertMatch(rclone.remoteConfig.displayCommand, /secret_access_key\s+\S*\*{2,}\S*/i, `${label}.remoteConfig.displayCommand`);
+  // The S3 secret must never reach process argv; it is injected through
+  // RCLONE_CONFIG_<REMOTE>_SECRET_ACCESS_KEY instead.
+  assert(
+    !rclone.remoteConfig.args.includes("secret_access_key"),
+    `${label}.remoteConfig.args must not carry secret_access_key`
+  );
+  if (rclone.remoteConfig.displayCommand.includes("SECRET_ACCESS_KEY")) {
+    assertMatch(
+      rclone.remoteConfig.displayCommand,
+      /SECRET_ACCESS_KEY="\S*\*{2,}\S*"/i,
+      `${label}.remoteConfig.displayCommand`
+    );
   }
   assertObject(rclone.storage, `${label}.storage`);
   assertNonEmptyString(rclone.remotePath, `${label}.remotePath`);
@@ -1123,7 +1128,17 @@ export function assertRclonePreviewContract(rclone, label = "rclone", options = 
     assertEqual(typeof rclone.safety[field], "boolean", `${label}.safety.${field}`);
   }
   if (options.remoteConfigSecret) {
-    assert(rclone.remoteConfig.args.includes(options.remoteConfigSecret), `${label}.remoteConfig.args secret`);
+    const secretEnvValues = Object.entries(rclone.remoteConfig.env)
+      .filter(([key]) => /SECRET_ACCESS_KEY$/i.test(key))
+      .map(([, value]) => value);
+    assert(
+      secretEnvValues.includes(options.remoteConfigSecret),
+      `${label}.remoteConfig.env secret`
+    );
+    assert(
+      !rclone.remoteConfig.args.includes(options.remoteConfigSecret),
+      `${label}.remoteConfig.args must not leak the secret`
+    );
   }
 }
 

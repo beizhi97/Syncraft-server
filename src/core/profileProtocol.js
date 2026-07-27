@@ -3,6 +3,7 @@ import { normalizeBandwidthLimit } from "./bandwidth.js";
 import { normalizeSyncSafety } from "./syncSafety.js";
 import { normalizeSchedule } from "./scheduler.js";
 import { createHttpError } from "./errors.js";
+import { sanitizeRemoteName } from "./storage.js";
 import { normalizePositiveInteger, normalizeTcpPort } from "./numbers.js";
 
 export const PROFILE_VERSION = 1;
@@ -79,9 +80,19 @@ export function normalizeImportProfile(input = {}) {
     storage: {
       type: "s3",
       remoteName: sanitizeRemoteName(storage.remoteName || "home-minio"),
+      // The http endpoint default is container-internal by architecture: the
+      // client only reaches it through the encrypted VLESS tunnel (rclone runs
+      // with a process-scoped SOCKS5 proxy) and compose binds MinIO to
+      // loopback on the host, so plaintext http never crosses a public network.
       endpoint: normalizeEndpoint(storage.endpoint || "http://minio:9000"),
       bucket: sanitizeBucketName(storage.bucket || "home-sync"),
       accessKeyId: String(storage.accessKeyId || clientName).trim(),
+      // CHANGE_ME_CLIENT_SECRET is a contract-registered compatibility fill for
+      // manual/legacy offline profiles only (INTERFACE_CONTRACT.md offline
+      // profile rules): it can never authenticate against a provisioned MinIO.
+      // Server-issued profiles (claim redeem, offline with source.server) are
+      // validated fail-closed in client/src/profileImport.js and must return
+      // profile_storage_required instead of ever reaching this default.
       secretAccessKey: String(storage.secretAccessKey || "CHANGE_ME_CLIENT_SECRET").trim(),
       prefix
     },
@@ -227,14 +238,6 @@ function sanitizeName(input) {
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(text)) {
     throw new Error("Client name can only contain letters, numbers, _ and -");
-  }
-  return text;
-}
-
-function sanitizeRemoteName(input) {
-  const text = String(input || "").trim();
-  if (!/^[A-Za-z0-9_-]+$/.test(text)) {
-    throw new Error("Remote name can only contain letters, numbers, _ and -");
   }
   return text;
 }

@@ -1,6 +1,12 @@
-.env
+node_modules/
 data/
+.env
+.env.*
+!.env.example
 sing-box/config.json
 sing-box/*.key
 sing-box/*.pem
+reports/
+dist/
+.tmp/
 *.log

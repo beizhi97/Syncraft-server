@@ -24,7 +24,7 @@ services:
       S3_CLIENT_ENDPOINT: http://n1-minio.sfsc:9000
       S3_BUCKET: ${S3_BUCKET:-home-sync}
       S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-syncadmin}
-      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-change-this-minio-root-password}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD before starting the server}
     ports:
       - "${SYNC_SERVER_PORT:-5177}:5177"
     volumes:
@@ -61,12 +61,12 @@ services:
     restart: unless-stopped
 
   minio:
-    image: quay.io/minio/minio:${MINIO_IMAGE_TAG:-RELEASE.2025-09-07T16-13-09Z}
+    image: quay.io/minio/minio:${MINIO_IMAGE_TAG:-RELEASE.2025-09-07T16-13-09Z}@${MINIO_IMAGE_DIGEST:-sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e}
     container_name: singbox-folder-sync-minio
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-syncadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-this-minio-root-password}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD before starting the server}
     expose:
       - "9000"
       - "9001"
@@ -78,13 +78,13 @@ services:
     restart: unless-stopped
 
   minio-init:
-    image: quay.io/minio/mc:${MINIO_MC_IMAGE_TAG:-RELEASE.2025-08-13T08-35-41Z}
+    image: quay.io/minio/mc:${MINIO_MC_IMAGE_TAG:-RELEASE.2025-08-13T08-35-41Z}@${MINIO_MC_IMAGE_DIGEST:-sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727}
     container_name: singbox-folder-sync-minio-init
     depends_on:
       - minio
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-syncadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-this-minio-root-password}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD before starting the server}
       S3_BUCKET: ${S3_BUCKET:-home-sync}
     entrypoint:
       - /bin/sh

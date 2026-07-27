@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "releaseTag": "v0.3.0-rc.1",
+  "version": "0.3.0-rc.1",
+  "sourceRepository": "beizhi97/Syncraft",
+  "sourceCommit": "5dec51cfa6c39621f478df4634d023629a090c60",
+  "sourceTreeHash": "6578a60726d53b1982b74d0cba8d875b518e8771bd1f54fc19491de2231d1e93",
+  "buildId": "sfsc-6578a60726d5",
+  "generatedAt": "2026-07-27T02:31:39.232Z"
+}

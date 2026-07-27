@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { normalizeBandwidthLimit } from "./bandwidth.js";
 import { CLAIM_CODE_ALPHABET, encodeClaimToken, extractClaimCode, normalizeClaimCode } from "./claimProtocol.js";
 import { ADMIN_STATE_VERSION, buildRuntimeDiagnostics, compareRuntimeDiagnostics, normalizeRuntimeDiagnostics } from "./diagnostics.js";
@@ -8,6 +8,7 @@ import { normalizeDeviceSync, summarizeDeviceSync } from "./syncRun.js";
 import { isUuid, parseVlessUri } from "./vless.js";
 import { createHttpError } from "./errors.js";
 import { PROFILE_VERSION } from "./profileProtocol.js";
+import { sanitizeRemoteName } from "./storage.js";
 
 const DEFAULTS = {
   publicServerUrl: "https://pass.971223.xyz:2025",
@@ -819,6 +820,11 @@ function ensureHeartbeatSecret(user) {
   return user.heartbeatSecret;
 }
 
+// Bounds the per-device nonce set that gets persisted into sfsc-state.json. The
+// default heartbeat interval (SFSC_HEARTBEAT_MS, 15s) puts ~20 entries in the
+// skew window, so this leaves 25x headroom while capping worst-case state growth.
+const HEARTBEAT_AUTH_NONCE_LIMIT = 512;
+
 function rememberHeartbeatAuthNonce(user, auth, options = {}) {
   const nowMs = options.nowMs ?? Date.now();
   const nonce = String(auth?.nonce || "");
@@ -826,14 +832,19 @@ function rememberHeartbeatAuthNonce(user, auth, options = {}) {
   if (user.heartbeatAuthNonces.some((item) => item.nonce === nonce)) {
     throw createHttpError("heartbeat_auth_invalid", 401, "Heartbeat authentication nonce was already used");
   }
+  // Overflow must reject, not evict. Dropping the oldest entries while they are
+  // still inside the skew window would silently reopen the replay hole this cache
+  // exists to close, and only a client heartbeating far faster than any sane
+  // interval can reach the limit. A 401 makes that misconfiguration visible
+  // instead of trading it for a replay window.
+  if (user.heartbeatAuthNonces.length >= HEARTBEAT_AUTH_NONCE_LIMIT) {
+    throw createHttpError("heartbeat_auth_invalid", 401, "Heartbeat authentication nonce window is saturated");
+  }
   user.heartbeatAuthNonces.push({
     nonce,
     timestamp: String(auth?.timestamp || ""),
     seenAt: new Date(nowMs).toISOString()
   });
-  if (user.heartbeatAuthNonces.length > 200) {
-    user.heartbeatAuthNonces = user.heartbeatAuthNonces.slice(-200);
-  }
 }
 
 function pruneHeartbeatAuthNonces(user, nowMs = Date.now()) {
@@ -849,7 +860,7 @@ function pruneHeartbeatAuthNonces(user, nowMs = Date.now()) {
 
 export function redeemClaim(state, input = {}) {
   const code = extractClaimCode(input.code || input.tKey || input.tkey || input.claimCode || input.token || "");
-  const claim = state.claims.find((item) => item.code === code);
+  const claim = findClaimByCode(state, code);
   if (!claim) {
     const error = new Error("claim_not_found");
     error.status = 404;
@@ -876,6 +887,21 @@ export function redeemClaim(state, input = {}) {
   rememberClaimRedeemBinding(claim, input);
   touch(state);
   return claim.profile;
+}
+
+// Compares candidate codes with a fixed-time digest compare so redemption does
+// not leak how many leading characters of a SyncKey were guessed correctly.
+function findClaimByCode(state, code) {
+  const claims = Array.isArray(state?.claims) ? state.claims : [];
+  const target = createHash("sha256").update(String(code || "")).digest();
+  let match = null;
+  for (const item of claims) {
+    const candidate = createHash("sha256").update(String(item?.code || "")).digest();
+    if (timingSafeEqual(candidate, target)) {
+      match = match || item;
+    }
+  }
+  return match;
 }
 
 export function compactAdminState(state, options = {}) {
@@ -1701,11 +1727,7 @@ function sanitizeClientName(input) {
 }
 
 function cleanRemoteName(input) {
-  const text = String(input || "").trim();
-  if (!/^[A-Za-z0-9_-]+$/.test(text)) {
-    throw validationError("Remote name can only contain letters, numbers, _ and -");
-  }
-  return text;
+  return sanitizeRemoteName(input, validationError);
 }
 
 function cleanBucket(input) {
@@ -1956,10 +1978,15 @@ function cleanRequiredCredential(input, field) {
   return input.trim();
 }
 
-function maskSecret(secret) {
-  const text = String(secret || "");
-  if (text.length <= 6) return "***";
-  return `${text.slice(0, 3)}***${text.slice(-3)}`;
+// Masked secrets must not leak any plaintext. The previous form kept the first
+// and last three characters, which is a meaningful disclosure for short or
+// low-entropy secrets and lets an observer confirm a guessed value. The mask is
+// always the literal "***": it is the documented sentinel meaning "keep the
+// existing secret" on write paths (see preserveExistingMasked* below and
+// docs/INTERFACE_CONTRACT.md), it satisfies the masked-secret contract for
+// absent values too, and a fixed width hides the real secret length.
+function maskSecret() {
+  return "***";
 }
 
 function maskRealityConfig(reality = {}) {
