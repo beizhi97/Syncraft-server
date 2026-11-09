@@ -1,8 +1,10 @@
 {
   "schemaVersion": 1,
-  "releaseTag": "v0.3.0-rc.3",
+  "releaseTag": "v0.3.0-rc.3-sfsc-4765c02d125a",
   "version": "0.3.0-rc.3",
+  "buildId": "sfsc-4765c02d125a",
+  "sourceTreeHash": "4765c02d125a54861f7e467e127b401a22548ad9ecb10583f44cffc3116c8822",
   "sourceRepository": "beizhi97/Syncraft",
-  "sourceCommit": "77890bd5d3b0878444fd573c0f84eb7c63f136e5",
-  "generatedAt": "2026-07-31T03:18:36.452Z"
+  "sourceCommit": "1c5029fe244ee814efb5c4dfe4a598951c0a9090",
+  "generatedAt": "2026-11-09T07:37:39.922138+00:00"
 }

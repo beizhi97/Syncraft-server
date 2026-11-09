@@ -6,6 +6,7 @@ import {
   normalizeRuntimeDiagnostics
 } from "../../src/core/diagnostics.js";
 import { PROFILE_VERSION } from "../../src/core/profileProtocol.js";
+import { isStableErrorCode } from "../../src/core/errors.js";
 
 const SYNC_STATES = ["idle", "syncing", "error", "stopping", "offline"];
 const DEVICE_STATUSES = ["online", "offline"];
@@ -40,11 +41,13 @@ export function assertRuntimeDiagnosticsContract(diagnostics, role, label = "dia
 
 export function assertClientStatusContract(status, label = "clientStatus", options = {}) {
   assertObject(status, label);
+  assertClientEnrollmentStatusContract(status.enrollment, label + ".enrollment");
   assertExactKeys(status, [
     "appVersion",
     "binaries",
     "clientVersion",
     "diagnostics",
+    "enrollment",
     "heartbeat",
     "jobs",
     "lastSuccessfulHeartbeat",
@@ -92,7 +95,7 @@ export function assertClientStatusContract(status, label = "clientStatus", optio
   assertArray(status.safeguards.localState.files, `${label}.safeguards.localState.files`);
   assertDeepEqual(
     status.safeguards.localState.files.map((file) => file.name).sort(),
-    ["claimRecovery", "jobs", "lastSuccessfulHeartbeat", "profile", "secrets", "syncHistory"],
+    ["claimRecovery", "jobs", "lastSuccessfulHeartbeat", "profile", "secrets", "syncHistory", "syncRecovery"],
     `${label}.safeguards.localState.files`
   );
   for (const file of status.safeguards.localState.files) {
@@ -124,8 +127,11 @@ export function assertClientStatusContract(status, label = "clientStatus", optio
   assertSchedulerContract(status.scheduler, `${label}.scheduler`);
   assertClientBinariesPresenceContract(status.binaries, `${label}.binaries`);
   assertObject(status.processes, `${label}.processes`);
-  assertExactKeys(status.processes, ["singbox", "sync"], `${label}.processes`);
+  assertExactKeys(status.processes, ["dataSingbox", "singbox", "sync"], `${label}.processes`);
   assertClientProcessStatusContract(status.processes.singbox, `${label}.processes.singbox`, "sing-box", {
+    exactKeys: ["lastExit", "name", "pid", "running", "startedAt"]
+  });
+  assertClientProcessStatusContract(status.processes.dataSingbox, `${label}.processes.dataSingbox`, "sftp-data-sing-box", {
     exactKeys: ["lastExit", "name", "pid", "running", "startedAt"]
   });
   assertClientProcessStatusContract(status.processes.sync, `${label}.processes.sync`, "rclone-sync", {
@@ -145,6 +151,59 @@ export function assertClientStatusContract(status, label = "clientStatus", optio
     assertEqual(status.lastSuccessfulHeartbeat.ok, true, `${label}.lastSuccessfulHeartbeat.ok`);
   }
   assertNoRawDiagnosticSecrets(status, label, options);
+}
+
+export function assertClientEnrollmentStatusContract(enrollment, label = "clientStatus.enrollment") {
+  assertObject(enrollment, label);
+  assertEqual(typeof enrollment.phase, "string", label + ".phase");
+  if (enrollment.phase === "local-state-error") {
+    assertExactKeys(enrollment, ["phase", "stateError"], label);
+    assert(["local_state_corrupt", "enrollment_trust_failed"].includes(enrollment.stateError), label + ".stateError");
+    assertNoRawDiagnosticSecrets(enrollment, label);
+    return;
+  }
+  assert(
+    ["not-started", "channel-verified", "request-pending", "identity-verified-awaiting-directory-authorization"].includes(enrollment.phase),
+    label + ".phase"
+  );
+  assertExactKeys(enrollment, [
+    "authorizedDirectories",
+    "deviceId",
+    "directoryAuthorization",
+    "phase",
+    "requestId",
+    "serverId",
+    "serverKeyFingerprint",
+    "signingKeyId",
+    "status",
+    ...(Object.hasOwn(enrollment, "lastError") ? ["lastError"] : [])
+  ], label);
+  for (const field of ["deviceId", "requestId", "serverId", "serverKeyFingerprint", "signingKeyId", "status"]) {
+    assertEqual(typeof enrollment[field], "string", label + "." + field);
+  }
+  assert(["granted", "waiting"].includes(enrollment.directoryAuthorization), label + ".directoryAuthorization");
+  assertArray(enrollment.authorizedDirectories, label + ".authorizedDirectories");
+  if (Object.hasOwn(enrollment, "lastError")) {
+    if (enrollment.lastError === null) {
+      assertEqual(enrollment.lastError, null, label + ".lastError");
+    } else {
+      assertObject(enrollment.lastError, label + ".lastError");
+      assertExactKeys(enrollment.lastError, ["code", "recordedAt"], label + ".lastError");
+      assert(enrollment.lastError.code.startsWith("enrollment_") && isStableErrorCode(enrollment.lastError.code), label + ".lastError.code");
+      assertNonEmptyString(enrollment.lastError.recordedAt, label + ".lastError.recordedAt");
+      assertMatch(enrollment.lastError.recordedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, label + ".lastError.recordedAt");
+      assertEqual(enrollment.lastError.recordedAt.length, 24, label + ".lastError.recordedAt.length");
+    }
+  }
+  for (const [index, directory] of enrollment.authorizedDirectories.entries()) {
+    const directoryLabel = label + ".authorizedDirectories[" + index + "]";
+    assertObject(directory, directoryLabel);
+    assertExactKeys(directory, ["displayName", "expiresAt", "relationId"], directoryLabel);
+    assertNonEmptyString(directory.relationId, directoryLabel + ".relationId");
+    assertNonEmptyString(directory.displayName, directoryLabel + ".displayName");
+    assertNonEmptyString(directory.expiresAt, directoryLabel + ".expiresAt");
+  }
+  assertNoRawDiagnosticSecrets(enrollment, label);
 }
 
 export function assertClientHealthContract(response, label = "clientHealth") {
@@ -345,8 +404,43 @@ export function assertServerIssuedProfileContract(profile, label = "serverIssued
   if (options.allowSource === true && profile.source !== undefined) {
     expectedKeys.push("source");
   }
+  // v2：从同步空间成员关系签发的 profile 必须携带这两块。
+  // /api/profile/encode 是管理调试/兼容入口，直接由请求体构造，背后没有同步空间，
+  // 因此调用方显式传 expectSyncSpaceBinding: false，且此时两块必须同时缺席——
+  // 只带一块意味着服务端算出了角色却没说清属于哪个空间（或反之），那才是真的坏状态。
+  const expectSyncSpaceBinding = options.expectSyncSpaceBinding !== false;
+  if (expectSyncSpaceBinding) {
+    expectedKeys.push("authorization", "syncSpace");
+  }
   assertExactKeys(profile, expectedKeys, label);
+  if (!expectSyncSpaceBinding) {
+    assertEqual(profile.syncSpace, undefined, `${label}.syncSpace must be absent without a sync space`);
+    assertEqual(profile.authorization, undefined, `${label}.authorization must be absent without a sync space`);
+  }
   assertEqual(profile.version, PROFILE_VERSION, `${label}.version`);
+  if (expectSyncSpaceBinding) {
+    assertObject(profile.syncSpace, `${label}.syncSpace`);
+    assertExactKeys(profile.syncSpace, ["id", "mode", "syncId"], `${label}.syncSpace`);
+    assertNonEmptyString(profile.syncSpace.id, `${label}.syncSpace.id`);
+    assertNonEmptyString(profile.syncSpace.syncId, `${label}.syncSpace.syncId`);
+    assert(
+      ["backup", "distribution", "collaboration"].includes(profile.syncSpace.mode),
+      `${label}.syncSpace.mode`
+    );
+    assertObject(profile.authorization, `${label}.authorization`);
+    assertExactKeys(profile.authorization, ["allowDelete", "directions", "role"], `${label}.authorization`);
+    assert(["owner", "writer", "reader"].includes(profile.authorization.role), `${label}.authorization.role`);
+    assertEqual(typeof profile.authorization.allowDelete, "boolean", `${label}.authorization.allowDelete`);
+    assertArray(profile.authorization.directions, `${label}.authorization.directions`);
+    // 空的方向集合意味着这个成员根本无法同步，签发这样的 profile 就是签发一个非法状态。
+    assert(profile.authorization.directions.length > 0, `${label}.authorization.directions must not be empty`);
+    for (const [index, direction] of profile.authorization.directions.entries()) {
+      assert(
+        ["upload", "download", "bidirectional"].includes(direction),
+        `${label}.authorization.directions[${index}]`
+      );
+    }
+  }
   assertNonEmptyString(profile.profileId, `${label}.profileId`);
   assertNonEmptyString(profile.clientName, `${label}.clientName`);
   if (options.expectedClientName !== undefined) {
@@ -448,7 +542,9 @@ export function assertProfileEncodeResponseContract(response, label = "profileEn
   assertExactKeys(response, ["code", "profile", "summary", "uri"], label);
   assertServerIssuedProfileContract(response.profile, `${label}.profile`, {
     ...options,
-    allowSource: true
+    allowSource: true,
+    // 该入口由请求体直接构造离线 profile，没有同步空间成员关系可绑定。
+    expectSyncSpaceBinding: false
   });
   assertObject(response.profile.source, `${label}.profile.source`);
   assertEqual(response.profile.source.type, "profile", `${label}.profile.source.type`);
@@ -787,10 +883,11 @@ export function assertAdminStateSummaryContract(state, label = "adminState", opt
 
 export function assertAdminSyncSpaceSummaryContract(syncSpace, label = "adminSyncSpace") {
   assertObject(syncSpace, label);
-  assertExactKeys(syncSpace, ["createdAt", "id", "memberCount", "policy", "status", "syncId", "version"], label);
+  assertExactKeys(syncSpace, ["createdAt", "id", "memberCount", "mode", "policy", "status", "syncId", "version"], label);
   assertNonEmptyString(syncSpace.id, `${label}.id`);
   assertNonEmptyString(syncSpace.syncId, `${label}.syncId`);
   assert(["active", "disabled"].includes(syncSpace.status), `${label}.status`);
+  assert(["backup", "distribution", "collaboration"].includes(syncSpace.mode), `${label}.mode`);
   assertObject(syncSpace.policy, `${label}.policy`);
   assertExactKeys(syncSpace.policy, ["multiWriter"], `${label}.policy`);
   assertEqual(typeof syncSpace.policy.multiWriter, "boolean", `${label}.policy.multiWriter`);
@@ -1095,6 +1192,102 @@ export function assertClientSyncRunResponseContract(response, label = "syncRun")
   assertNoRawDiagnosticSecrets(response, label);
 }
 
+export function assertClientRecoveryVersionsResponseContract(response, label = "syncRecoveryVersions") {
+  assertObject(response, label);
+  assertExactKeys(response, ["jobId", "versions"], label);
+  assertNonEmptyString(response.jobId, `${label}.jobId`);
+  assertArray(response.versions, `${label}.versions`);
+  for (const [index, version] of response.versions.entries()) {
+    const versionLabel = `${label}.versions[${index}]`;
+    assertObject(version, versionLabel);
+    assertExactKeys(version, ["createdAt", "files", "runId", "status"], versionLabel);
+    assertMatch(version.runId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i, `${versionLabel}.runId`);
+    assertMatch(version.createdAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/, `${versionLabel}.createdAt`);
+    assert(["preparing", "prepared", "running", "completed", "failed"].includes(version.status), `${versionLabel}.status`);
+    assertArray(version.files, `${versionLabel}.files`);
+    for (const [fileIndex, file] of version.files.entries()) {
+      const fileLabel = `${versionLabel}.files[${fileIndex}]`;
+      assertObject(file, fileLabel);
+      assertExactKeys(file, ["path", "side"], fileLabel);
+      assert(["path1", "path2"].includes(file.side), `${fileLabel}.side`);
+      assertNonEmptyString(file.path, `${fileLabel}.path`);
+      assert(!file.path.startsWith("/") && !file.path.split("/").includes(".."), `${fileLabel}.path must be relative and bounded`);
+    }
+  }
+  assertNoRawDiagnosticSecrets(response, label);
+}
+
+export function assertClientRecoveryRestorePreviewResponseContract(response, label = "syncRecoveryRestorePreview") {
+  assertObject(response, label);
+  assertExactKeys(response, ["jobId", "preview"], label);
+  assertNonEmptyString(response.jobId, `${label}.jobId`);
+  const preview = response.preview;
+  assertObject(preview, `${label}.preview`);
+  assertExactKeys(preview, ["destinationPath", "expiresAt", "path", "previewId", "runId", "side", "sourceSha256"], `${label}.preview`);
+  for (const field of ["destinationPath", "path"]) assertNonEmptyString(preview[field], `${label}.preview.${field}`);
+  for (const field of ["previewId", "runId"]) assertMatch(preview[field], /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i, `${label}.preview.${field}`);
+  assert(["path1", "path2"].includes(preview.side), `${label}.preview.side`);
+  assertMatch(preview.sourceSha256, /^[a-f0-9]{64}$/, `${label}.preview.sourceSha256`);
+  assertMatch(preview.expiresAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/, `${label}.preview.expiresAt`);
+  assertNoRawDiagnosticSecrets(response, label);
+}
+
+export function assertClientRecoveryRestoreResponseContract(response, label = "syncRecoveryRestore") {
+  assertObject(response, label);
+  assertExactKeys(response, ["destinationPath", "jobId", "restored", "runId", "sourceSha256"], label);
+  assertNonEmptyString(response.jobId, `${label}.jobId`);
+  assertEqual(response.restored, true, `${label}.restored`);
+  assertNonEmptyString(response.destinationPath, `${label}.destinationPath`);
+  assertMatch(response.runId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i, `${label}.runId`);
+  assertMatch(response.sourceSha256, /^[a-f0-9]{64}$/, `${label}.sourceSha256`);
+  assertNoRawDiagnosticSecrets(response, label);
+}
+
+export function assertClientRecoveryRestoreCancelResponseContract(response, label = "syncRecoveryRestoreCancel") {
+  assertObject(response, label);
+  assertExactKeys(response, ["cancelled", "jobId"], label);
+  assertNonEmptyString(response.jobId, `${label}.jobId`);
+  assertEqual(typeof response.cancelled, "boolean", `${label}.cancelled`);
+  assertNoRawDiagnosticSecrets(response, label);
+}
+
+export function assertClientFirstBisyncConflictOperationsResponseContract(response, label = "firstBisyncConflictOperations") {
+  assertObject(response, label);
+  assertExactKeys(response, ["operations"], label);
+  assertArray(response.operations, `${label}.operations`);
+  for (const [index, operation] of response.operations.entries()) assertFirstBisyncConflictOperation(operation, `${label}.operations[${index}]`);
+  assertNoRawDiagnosticSecrets(response, label);
+}
+
+export function assertClientFirstBisyncConflictResumeResponseContract(response, label = "firstBisyncConflictResume") {
+  assertObject(response, label);
+  assertExactKeys(response, ["saved"], label);
+  assertFirstBisyncConflictOperation(response.saved, `${label}.saved`);
+  assertNoRawDiagnosticSecrets(response, label);
+}
+
+function assertFirstBisyncConflictOperation(operation, label) {
+  assertObject(operation, label);
+  assertExactKeys(operation, ["conflicts", "createdAt", "operationId", "savedAt", "status"], label);
+  assertMatch(operation.operationId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i, `${label}.operationId`);
+  assert(["saving", "saved"].includes(operation.status), `${label}.status`);
+  assertMatch(operation.createdAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/, `${label}.createdAt`);
+  assertEqual(typeof operation.savedAt, "string", `${label}.savedAt`);
+  assertArray(operation.conflicts, `${label}.conflicts`);
+  for (const [index, conflict] of operation.conflicts.entries()) {
+    const conflictLabel = `${label}.conflicts[${index}]`;
+    assertObject(conflict, conflictLabel);
+    assertExactKeys(conflict, ["localHash", "localSize", "localTarget", "path", "remoteHash", "remoteSize", "remoteTarget", "status"], conflictLabel);
+    for (const field of ["path", "localTarget", "remoteTarget"]) {
+      assertNonEmptyString(conflict[field], `${conflictLabel}.${field}`);
+      assert(!conflict[field].startsWith("/") && !conflict[field].split("/").includes(".."), `${conflictLabel}.${field} must be relative and bounded`);
+    }
+    for (const field of ["localHash", "remoteHash"]) assertMatch(conflict[field], /^[a-f0-9]{64}$/, `${conflictLabel}.${field}`);
+    for (const field of ["localSize", "remoteSize"]) assert(Number.isSafeInteger(conflict[field]) && conflict[field] >= 0, `${conflictLabel}.${field}`);
+    assert(["pending", "saved"].includes(conflict.status), `${conflictLabel}.status`);
+  }
+}
+
 export function assertRclonePreviewContract(rclone, label = "rclone", options = {}) {
   assertObject(rclone, label);
   assertNonEmptyString(rclone.executable, `${label}.executable`);
@@ -1242,6 +1435,7 @@ function assertDiagnosticStatusContract(status, label = "diagnosticBundle.status
     "appVersion",
     "binaries",
     "diagnostics",
+    "enrollment",
     "heartbeat",
     "jobs",
     "lastSuccessfulHeartbeat",
@@ -1251,6 +1445,15 @@ function assertDiagnosticStatusContract(status, label = "diagnosticBundle.status
     "safeguards"
   ], label);
   assertEqual(typeof status.appVersion, "string", `${label}.appVersion`);
+  assertObject(status.enrollment, `${label}.enrollment`);
+  assertExactKeys(status.enrollment, ["lastError"], `${label}.enrollment`);
+  if (status.enrollment.lastError !== null) {
+    assertObject(status.enrollment.lastError, `${label}.enrollment.lastError`);
+    assertExactKeys(status.enrollment.lastError, ["code", "recordedAt"], `${label}.enrollment.lastError`);
+    assert(status.enrollment.lastError.code.startsWith("enrollment_") && isStableErrorCode(status.enrollment.lastError.code), `${label}.enrollment.lastError.code`);
+    assertMatch(status.enrollment.lastError.recordedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `${label}.enrollment.lastError.recordedAt`);
+    assertEqual(status.enrollment.lastError.recordedAt.length, 24, `${label}.enrollment.lastError.recordedAt.length`);
+  }
   assertEqual(typeof status.profileImported, "boolean", `${label}.profileImported`);
   if (status.diagnostics === null) {
     assertEqual(status.diagnostics, null, `${label}.diagnostics`);
@@ -1540,7 +1743,8 @@ function assertDiagnosticEnvironmentContract(environment, label, options = {}) {
       assertNoLocalDiagnosticPaths(environment.binaries[field].path, `${label}.binaries.${field}.path`);
     }
     assertObject(environment.stateFiles, `${label}.stateFiles`);
-    for (const field of ["profile", "jobs", "secrets", "syncHistory", "claimRecovery", "lastSuccessfulHeartbeat"]) {
+    assertExactKeys(environment.stateFiles, ["claimRecovery", "jobs", "lastSuccessfulHeartbeat", "profile", "secrets", "syncHistory", "syncRecovery"], `${label}.stateFiles`);
+    for (const field of ["profile", "jobs", "secrets", "syncHistory", "syncRecovery", "claimRecovery", "lastSuccessfulHeartbeat"]) {
       assertFileSummaryContract(environment.stateFiles[field], `${label}.stateFiles.${field}`);
       assertNoLocalDiagnosticPaths(environment.stateFiles[field].path, `${label}.stateFiles.${field}.path`);
     }
@@ -1855,12 +2059,22 @@ function assertServerSingboxConfigContract(config, state, label) {
     assertNonEmptyString(user.name, `${userLabel}.name`);
     assertNonEmptyString(user.uuid, `${userLabel}.uuid`);
   }
+  const bootstrapUsers = inbound.users.filter((user) => user.name === "sfsc-enrollment-bootstrap");
+  assert(bootstrapUsers.length <= 1, `${label}.inbounds[0].users must contain at most one enrollment bootstrap identity`);
+  for (const [index, user] of bootstrapUsers.entries()) {
+    assertMatch(
+      user.uuid,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      `${label}.inbounds[0].users.bootstrap[${index}].uuid`
+    );
+  }
   if (state) {
     const activeUsers = state.users.filter((user) => user.enabled !== false && !user.deletedAt);
-    assertEqual(inbound.users.length, activeUsers.length, `${label}.inbounds[0].users.length`);
+    const configuredAdminUsers = inbound.users.filter((user) => user.name !== "sfsc-enrollment-bootstrap");
+    assertEqual(configuredAdminUsers.length, activeUsers.length, `${label}.inbounds[0].users.admin.length`);
     for (const user of activeUsers) {
       assert(
-        inbound.users.some((item) => item.name === user.clientName && item.uuid === user.uuid),
+        configuredAdminUsers.some((item) => item.name === user.clientName && item.uuid === user.uuid),
         `${label}.inbounds[0].users.${user.clientName}`
       );
     }

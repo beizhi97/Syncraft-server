@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { normalizeBandwidthLimit } from "./bandwidth.js";
-import { CLAIM_CODE_ALPHABET, encodeClaimToken, extractClaimCode } from "./claimProtocol.js";
+import { CLAIM_CODE_ALPHABET, encodeClaimToken, extractClaimCode, normalizeClaimServer } from "./claimProtocol.js";
 import { ADMIN_STATE_VERSION, buildRuntimeDiagnostics, compareRuntimeDiagnostics, normalizeRuntimeDiagnostics } from "./diagnostics.js";
 import { HEARTBEAT_AUTH_MAX_SKEW_MS, createHeartbeatSecret, verifyHeartbeatAuth } from "./heartbeatAuth.js";
 import { normalizeSchedule } from "./scheduler.js";
@@ -9,6 +9,21 @@ import { isUuid, parseVlessUri } from "./vless.js";
 import { createHttpError } from "./errors.js";
 import { PROFILE_VERSION } from "./profileProtocol.js";
 import { sanitizeRemoteName } from "./storage.js";
+import {
+  PRIVATE_SYNC_SPACE_MODE,
+  deriveAuthorization,
+  deriveSyncDirections,
+  normalizeSyncSpaceMode,
+  requireSyncSpaceMode
+} from "./syncSpaceMode.js";
+
+// 出厂占位口令。它同时是「管理员还没配过存储」的判定依据（见 setupReadiness.js），
+// 和生产启动的 fail-closed 门槛（见 server.js 的 PLACEHOLDER_STORAGE_SECRETS）。
+// 两处必须引用同一个常量：各写一份字面量就会改一处漏一处，而漏掉的那处要么放行
+// 出厂口令上生产，要么把未配置的部署报成已就绪。
+export const DEFAULT_STORAGE_SECRET_PLACEHOLDER = "change-this-minio-root-password";
+export const DEFAULT_REALITY_SERVER_NAME = "www.apple.com";
+const LEGACY_REALITY_DEFAULT_SERVER_NAME = "www.microsoft.com";
 
 const DEFAULTS = {
   publicServerUrl: "https://pass.971223.xyz:2025",
@@ -51,7 +66,7 @@ export function createDefaultAdminState(env = {}) {
     version: ADMIN_STATE_VERSION,
     updatedAt: now,
     settings: {
-      publicServerUrl: cleanUrl(env.PUBLIC_SERVER_URL || env.CLAIM_SERVER_URL || DEFAULTS.publicServerUrl)
+      publicServerUrl: cleanClaimServerOrigin(env.PUBLIC_SERVER_URL || env.CLAIM_SERVER_URL || DEFAULTS.publicServerUrl)
     },
     tunnel: {
       id: "vless-main",
@@ -66,7 +81,7 @@ export function createDefaultAdminState(env = {}) {
       transportPath: "",
       remark: "sfsc-home",
       reality: {
-        serverName: env.REALITY_SERVER_NAME || "www.microsoft.com",
+        serverName: env.REALITY_SERVER_NAME || DEFAULT_REALITY_SERVER_NAME,
         fingerprint: env.REALITY_FINGERPRINT || "chrome",
         publicKey: env.REALITY_PUBLIC_KEY || "",
         privateKey: env.REALITY_PRIVATE_KEY || "",
@@ -86,7 +101,7 @@ export function createDefaultAdminState(env = {}) {
       bucket: cleanBucket(env.S3_BUCKET || DEFAULTS.s3Bucket),
       accessKeyMode: "shared",
       accessKeyId: String(env.S3_ACCESS_KEY_ID || env.MINIO_ROOT_USER || "syncadmin"),
-      secretAccessKey: String(env.S3_SECRET_ACCESS_KEY || env.MINIO_ROOT_PASSWORD || "change-this-minio-root-password"),
+      secretAccessKey: String(env.S3_SECRET_ACCESS_KEY || env.MINIO_ROOT_PASSWORD || DEFAULT_STORAGE_SECRET_PLACEHOLDER),
       prefixRoot: "devices",
       sharedPrefix: "shared",
       buckets: [
@@ -137,7 +152,7 @@ export function normalizeAdminState(input = {}, env = {}) {
   };
   state.version = ADMIN_STATE_VERSION;
 
-  state.settings.publicServerUrl = cleanUrl(state.settings.publicServerUrl);
+  state.settings.publicServerUrl = cleanClaimServerOrigin(state.settings.publicServerUrl);
   state.tunnel.listenPort = readPort(state.tunnel.listenPort);
   state.tunnel.publicPort = readPort(state.tunnel.publicPort);
   state.tunnel.publicHost = cleanHost(state.tunnel.publicHost);
@@ -282,6 +297,7 @@ function normalizeSyncSpaceState(inputSpaces, inputMemberships, users) {
           prefix: cleanPrefix(storageTarget.prefix)
         },
         policy: { multiWriter: false },
+        mode: normalizeSyncSpaceMode(source.mode),
         status: source.status === "disabled" ? "disabled" : "active",
         version: 1,
         createdAt: normalizeCreatedAt(source.createdAt)
@@ -335,6 +351,8 @@ function normalizeSyncSpaceState(inputSpaces, inputMemberships, users) {
         prefix: cleanPrefix(user.storage.prefix)
       },
       policy: { multiWriter: false },
+      // 既有安装的设备私有空间：保留双向能力，见 syncSpaceMode.js 的 PRIVATE_SYNC_SPACE_MODE。
+      mode: PRIVATE_SYNC_SPACE_MODE,
       status: user.deletedAt || user.enabled === false ? "disabled" : "active",
       version: 1,
       createdAt: user.createdAt
@@ -443,8 +461,12 @@ export function autoFillTunnelConfig(state, input = {}) {
           publicKey: current.publicKey,
           privateKey: current.privateKey
         };
+    const savedServerName = current.serverName === LEGACY_REALITY_DEFAULT_SERVER_NAME
+      && !current.publicKey && !current.privateKey && !current.shortId
+      ? DEFAULT_REALITY_SERVER_NAME
+      : current.serverName || DEFAULT_REALITY_SERVER_NAME;
     patch.reality = {
-      serverName: inputFieldOrDefault(input, "serverName", current.serverName || "www.microsoft.com"),
+      serverName: inputFieldOrDefault(input, "serverName", savedServerName),
       fingerprint: inputFieldOrDefault(input, "fingerprint", current.fingerprint || "chrome"),
       publicKey: keypair.publicKey,
       privateKey: keypair.privateKey,
@@ -687,7 +709,7 @@ export function createClaim(state, input = {}) {
     : sanitizeClientName(inputFieldOrDefault(input, "clientName", "company-pc1"));
   const hasSelectedBucket = hasAnyInputField(input, ["bucketName", "bucket"]);
   const selectedBucketName = firstInputFieldOrDefault(input, ["bucketName", "bucket"], undefined);
-  const serverUrl = cleanUrl(inputFieldOrDefault(input, "server", state.settings.publicServerUrl));
+  const serverUrl = cleanClaimServerOrigin(inputFieldOrDefault(input, "server", state.settings.publicServerUrl));
   const now = new Date();
   const expiresAt = normalizeClaimExpiresAt(input, now);
   const profileExpiresAt = normalizeClaimProfileExpiresAt(input.profileExpiresAt);
@@ -701,6 +723,11 @@ export function createClaim(state, input = {}) {
   const targetSyncSpace = requestedSyncSpaceId
     ? requireActiveSyncSpace(state, requestedSyncSpaceId)
     : null;
+  // 在创建设备之前拦截。createManagedUser 在下面几行就会写入 state.users，
+  // 若等到 addSyncSpaceMembership 才抛错，被拒绝的请求会留下一台幽灵设备。
+  if (targetSyncSpace) {
+    requireRoleAllowedInSyncSpace(targetSyncSpace, normalizeSyncSpaceRole(input.requestedRole));
+  }
   if (targetSyncSpace && hasSelectedBucket && selectedBucketName !== targetSyncSpace.storageTarget.bucket) {
     throw validationError("bucketName must match the selected sync space storage target");
   }
@@ -1061,6 +1088,7 @@ export function createSyncSpace(state, input = {}) {
       prefix: cleanPrefix(input.prefix || `${state.storage.sharedPrefix}/${id}`)
     },
     policy: { multiWriter: false },
+    mode: requireSyncSpaceMode(input.mode),
     status: "active",
     version: 1,
     createdAt: new Date().toISOString()
@@ -1084,10 +1112,17 @@ function addSyncSpaceMembership(state, syncSpaceId, deviceId, role) {
   if (existing && !existing.revokedAt) {
     throw createHttpError("sync_space_membership_exists", 409, "Device is already a sync space member");
   }
+  const normalizedRole = normalizeSyncSpaceRole(role);
+  // 单一入口的不变式：任何调用方都不能给成员留下一个空的合法方向集合。
+  // createClaim 已在建设备之前先查一次，这里兜住其余调用方。
+  const syncSpace = (state.syncSpaces || []).find((item) => item.id === syncSpaceId);
+  if (syncSpace) {
+    requireRoleAllowedInSyncSpace(syncSpace, normalizedRole);
+  }
   const membership = {
     syncSpaceId,
     deviceId,
-    role: normalizeSyncSpaceRole(role),
+    role: normalizedRole,
     credentialId: null,
     accessKeyId: null,
     secretAccessKey: null,
@@ -1100,6 +1135,19 @@ function addSyncSpaceMembership(state, syncSpaceId, deviceId, role) {
   }
   state.syncSpaceMemberships.push(membership);
   return membership;
+}
+
+// 备份用途的空间没有 reader 座位：deriveSyncDirections 对该组合返回空集合，
+// 一个没有任何合法方向的成员是无法被界面表达的非法状态，因此在入座时就拒绝。
+function requireRoleAllowedInSyncSpace(syncSpace, role) {
+  const mode = normalizeSyncSpaceMode(syncSpace?.mode);
+  if (deriveSyncDirections(mode, role).length === 0) {
+    throw createHttpError(
+      "sync_space_role_not_allowed",
+      409,
+      `Role ${role} is not allowed in a ${mode} sync space`
+    );
+  }
 }
 
 function requireActiveSyncSpaceMembership(state, syncSpaceId, deviceId) {
@@ -1129,6 +1177,7 @@ function ensureDevicePrivateSyncSpace(state, user) {
       prefix: cleanPrefix(user.storage.prefix)
     },
     policy: { multiWriter: false },
+    mode: PRIVATE_SYNC_SPACE_MODE,
     status: user.deletedAt || user.enabled === false ? "disabled" : "active",
     version: 1,
     createdAt: user.createdAt
@@ -1347,12 +1396,33 @@ function hashRedeemBinding(value) {
 
 export function buildProfileForUser(state, user, options = {}) {
   const defaults = normalizeProfileDefaults(state.defaults, options.defaults);
+  // 空间与角色此前在这里被整个丢弃，客户端因此既不知道自己在哪个空间，
+  // 也不知道自己的角色，只能把方向当成用户的一次猜测。
+  const syncSpace = options.syncSpaceId
+    ? (state.syncSpaces || []).find((item) => item.id === options.syncSpaceId)
+    : null;
+  const role = options.storageCredentials?.role
+    || (syncSpace
+      ? (state.syncSpaceMemberships || []).find((item) => item.syncSpaceId === syncSpace.id && item.deviceId === user.id && !item.revokedAt)?.role
+      : "");
   const profile = {
     version: PROFILE_VERSION,
     profileId: options.profileId || `profile-${user.clientName}-${randomBytes(3).toString("hex")}`,
     clientName: user.clientName,
     issuedAt: new Date().toISOString(),
     expiresAt: options.expiresAt || null,
+    ...(syncSpace ? {
+      syncSpace: {
+        id: syncSpace.id,
+        syncId: syncSpace.syncId,
+        mode: normalizeSyncSpaceMode(syncSpace.mode)
+      },
+      authorization: deriveAuthorization({
+        mode: syncSpace.mode,
+        role,
+        policy: syncSpace.policy
+      })
+    } : {}),
     tunnel: {
       type: "vless",
       uri: buildVlessUri(state.tunnel, user)
@@ -1547,6 +1617,7 @@ export function summarizeAdminSyncSpace(state, syncSpace) {
     syncId: String(syncSpace.syncId || ""),
     status: syncSpace.status === "disabled" ? "disabled" : "active",
     policy: { multiWriter: syncSpace.policy?.multiWriter === true },
+    mode: normalizeSyncSpaceMode(syncSpace.mode),
     version: Number(syncSpace.version || 1),
     createdAt: String(syncSpace.createdAt || ""),
     memberCount: state.syncSpaceMemberships.filter((membership) => membership.syncSpaceId === syncSpace.id && !membership.revokedAt).length
@@ -1858,9 +1929,17 @@ function cleanUrl(input) {
   return url.toString().replace(/\/$/g, "");
 }
 
+function cleanClaimServerOrigin(input) {
+  try {
+    return normalizeClaimServer(input);
+  } catch (error) {
+    throw validationError(error.message);
+  }
+}
+
 function normalizeRealityConfig(input = {}) {
   return {
-    serverName: cleanServerName(input.serverName || "www.microsoft.com"),
+    serverName: cleanServerName(input.serverName || DEFAULT_REALITY_SERVER_NAME),
     fingerprint: String(input.fingerprint || "chrome").trim(),
     publicKey: String(input.publicKey || "").trim(),
     privateKey: String(input.privateKey || "").trim(),

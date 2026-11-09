@@ -57,6 +57,8 @@ node scripts/release-signature.mjs verify dist/release-bundles/<bundle>.zip
 
 ## 2. 服务端部署
 
+本节沿用的 Docker Compose、MinIO 密码和 bucket 配置说明是 S3/MinIO 兼容模式。N1 普通目录模式使用独立的 systemd unit 和安装器，不需要 MinIO；按 [服务端普通目录部署说明](../server/DEPLOYMENT.md) 操作。旧模式的默认配置与运行数据保持不变。
+
 进入服务端目录：
 
 ```bash
@@ -265,6 +267,8 @@ node scripts/smoke-client.mjs --base-url http://127.0.0.1:5188 --json-report rep
 
 ## 3. 服务端状态恢复
 
+**Enrollment catalog v2 upgrade boundary:** a server release that writes catalog schema v2 migrates a v1 catalog forward under the catalog lock and persists the v2 state. Older server binaries that only understand v1 cannot be assumed to read or safely modify that v2 catalog. Do not roll back only the binary after this migration, delete the revocation journal, or restore an older authority projection to undo a revoke. Any rollback must restore a mutually compatible server and catalog state through an explicitly validated recovery procedure; this guide does not provide an automatic downgrade or journal-removal procedure.
+
 通用自托管 Beta 使用 Caddy 作为 HTTPS 入口。DNS 必须先把 `SFSC_PUBLIC_HOST` 指向服务器，并放通 `80/tcp`、`443/tcp` 与 VLESS 端口；`sync-server:5177` 不应直接暴露。首次部署或升级后执行：
 
 ```bash
@@ -373,7 +377,7 @@ dist/SyncraftClient.zip
 
 - 在用户可写、非临时目录解压，例如 `%LOCALAPPDATA%\Syncraft\`、`C:\Tools\Syncraft\` 或现场约定的软件目录；不要直接在 ZIP、下载临时目录或会被清理的目录中运行。
 - 保留 ZIP 内根目录结构，桌面包入口为 `SyncraftDesktop/Syncraft.exe`，旧式便携包入口为 `SyncraftClient/Syncraft.exe`。
-- 首次启动后在设置中导入服务端生成的 SyncKey，再配置本地文件夹、同步方向、计划任务、并行文件和单文件线程。
+- 首次启动后在设置中导入服务端生成的 SyncKey，再配置本地文件夹与计划任务。同步空间和远端目标由 SyncKey 绑定，同步方向由该空间授权给本设备的角色决定，客户端不提供手工选择入口；带宽限制在“高级参数”中。rclone 的并发文件数与单文件线程数不再由用户填写，改用固定默认值。
 
 升级：
 

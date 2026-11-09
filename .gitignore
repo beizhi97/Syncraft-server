@@ -3,6 +3,7 @@ data/
 .env
 .env.*
 !.env.example
+!.env.directory.example
 sing-box/config.json
 sing-box/*.key
 sing-box/*.pem
@@ -10,3 +11,4 @@ reports/
 dist/
 .tmp/
 *.log
+__pycache__/

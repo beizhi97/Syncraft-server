@@ -1,22 +1,10 @@
 # Syncraft Server Delivery
 
-Generated server delivery for v0.3.0-rc.3 from beizhi97/Syncraft commit 77890bd5d3b0878444fd573c0f84eb7c63f136e5.
+Generated server delivery for `v0.3.0-rc.3-sfsc-4765c02d125a` (`sfsc-4765c02d125a`) from [beizhi97/Syncraft](https://github.com/beizhi97/Syncraft) commit `1c5029fe244ee814efb5c4dfe4a598951c0a9090`.
 
-This repository is a generated deployment view. Do not edit application code
-here; make changes in the source repository, validate them, tag the source
-version, then republish.
+- **Build ID**: `sfsc-4765c02d125a`
+- **Source Tree Hash**: `4765c02d125a54861f7e467e127b401a22548ad9ecb10583f44cffc3116c8822`
 
-## Deploy
+This repository is a generated deployment view. Do not edit application code here; make changes in the source repository, validate them, tag the source version, then republish.
 
-Copy .env.example to .env and set at least SFSC_PUBLIC_HOST, SFSC_ADMIN_TOKEN
-and MINIO_ROOT_PASSWORD, then:
-
-    docker compose up --build -d
-
-MINIO_ROOT_PASSWORD is mandatory: compose refuses to start without it rather
-than falling back to a placeholder. Management APIs also refuse access unless
-SFSC_ADMIN_TOKEN is set.
-
-Runtime files (.env, data/, sing-box/config.json, private keys) are excluded by
-design. See docs/DEPLOYMENT_AND_MIGRATION_GUIDE.md for backup, upgrade and
-rollback procedures.
+For N1 / Linux ordinary-directory mode, read [DEPLOYMENT.md](DEPLOYMENT.md) and copy `.env.directory.example` to `.env`, then run `./install-n1-directory-appliance.sh`. Runtime files such as `.env`, `data/`, and `sing-box/config.json` are deliberately excluded.

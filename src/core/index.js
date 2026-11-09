@@ -1,6 +1,6 @@
 export { parseVlessUri } from "./vless.js";
 export { buildClientSingboxConfig } from "./singbox.js";
-export { buildRclonePreview } from "./rclone.js";
+export { buildRclonePreview, toRcloneBisyncResyncMode } from "./rclone.js";
 export { buildMinioPolicyName, buildMinioPrefixPolicy } from "./minioPolicy.js";
 export { computeNextRun, describeSchedule, normalizeSchedule } from "./scheduler.js";
 export {
@@ -51,9 +51,11 @@ export {
   decodeClaimToken,
   encodeClaimToken,
   extractClaimCode,
+  normalizeClaimServer,
   normalizeClaimPayload
 } from "./claimProtocol.js";
 export {
+  DEFAULT_STORAGE_SECRET_PLACEHOLDER,
   autoFillTunnelConfig,
   buildProfileForUser,
   buildSingboxServerConfig,

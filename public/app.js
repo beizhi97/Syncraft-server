@@ -22,9 +22,12 @@ const fields = {
   newSyncId: byId("newSyncId"),
   syncSpaceOwnerSelect: byId("syncSpaceOwnerSelect"),
   syncSpaceSelect: byId("syncSpaceSelect"),
+  newSyncSpaceMode: byId("newSyncSpaceMode"),
   syncSpaceRole: byId("syncSpaceRole"),
   deviceName: byId("deviceName"),
   bucketSelect: byId("bucketSelect"),
+  newDeviceName: byId("newDeviceName"),
+  newDeviceBucket: byId("newDeviceBucket"),
   expiresInHours: byId("expiresInHours"),
   transfers: byId("transfers"),
   streams: byId("streams"),
@@ -40,10 +43,14 @@ const fields = {
 };
 
 let state = null;
+// null 表示「就绪度未取到」，不是「一切正常」。渲染侧必须按未验证处理。
+let setupReadiness = null;
 let latestClaimTKey = "";
 let latestClaimUri = "";
 let latestClaimShortCode = "";
 const adminTokenStorageKey = "sfsc-admin-token";
+const enrollmentReconfigureStorageKey = "sfsc-enrollment-reconfigure-operation";
+const enrollmentRevocationStorageKey = "sfsc-enrollment-revocation-operation";
 let adminToken = localStorage.getItem(adminTokenStorageKey) || "";
 let adminAuthEnabled = false;
 let pendingConfirmation = null;
@@ -65,11 +72,24 @@ fields.deviceCompatFilter.addEventListener("change", renderDevices);
 fields.deviceSearch.addEventListener("input", renderDevices);
 byId("createClaimBtn").addEventListener("click", createClaim);
 byId("createSyncSpaceBtn").addEventListener("click", createSyncSpace);
+byId("createDeviceBtn").addEventListener("click", createDevice);
+byId("refreshEnrollmentDirectoriesBtn").addEventListener("click", loadEnrollmentDirectories);
+byId("refreshEnrollmentDirectoriesBtn").addEventListener("click", loadEnrollmentRequests);
+byId("openEnrollmentDirectoryBtn").addEventListener("click", openEnrollmentDirectory);
+byId("createEnrollmentChannelCodeBtn").addEventListener("click", createEnrollmentChannelCode);
+byId("reconfigureEnrollmentChannelBtn").addEventListener("click", reconfigureEnrollmentChannel);
 byId("copyClaimBtn").addEventListener("click", copyClaim);
+byId("copyShortClaimBtn").addEventListener("click", copyShortClaim);
 byId("copyClaimUriBtn").addEventListener("click", copyClaimUri);
 byId("redeemPreviewBtn").addEventListener("click", redeemPreview);
 byId("refreshBtn").addEventListener("click", loadState);
 byId("refreshOverviewBtn").addEventListener("click", loadState);
+byId("refreshSetupBtn").addEventListener("click", loadState);
+byId("setupStepList").addEventListener("click", (event) => {
+  const target = event.target instanceof Element ? event.target.closest("[data-tab-target]") : null;
+  if (!target || !event.currentTarget.contains(target)) return;
+  switchTab(target.dataset.tabTarget);
+});
 byId("loginForm").addEventListener("submit", loginAdmin);
 byId("logoutBtn").addEventListener("click", logoutAdmin);
 byId("confirmForm").addEventListener("submit", submitConfirmation);
@@ -107,13 +127,13 @@ async function checkHealth() {
     healthDot.classList.remove("ok", "good", "warn", "err");
     if (serviceHealth.restartRequired) {
       healthDot.classList.add("warn");
-      healthText.textContent = "API 可达 · 待重启";
+      healthText.textContent = "管理 API 可达 · 待重启";
     } else if (!result.ok) {
       healthDot.classList.add("err");
       healthText.textContent = "API 异常";
     } else {
       healthDot.classList.add("good");
-      healthText.textContent = "API 可达";
+      healthText.textContent = "管理 API 可达";
     }
     byId("diagnosticsStatus").textContent = formatRuntimeDiagnostics(result.diagnostics);
     updateAuthStatus(Boolean(adminToken));
@@ -131,7 +151,11 @@ async function loadState() {
     state = await api("/api/admin/state");
     hideAuthGate();
     updateAuthStatus(true);
+    // 就绪度先取再渲染：概览的隧道/存储灯现在读它，缺了会退回「未验证」而不是谎报就绪。
+    await loadSetupReadiness();
     renderState();
+    await loadEnrollmentDirectories();
+    await loadEnrollmentRequests();
   } catch (error) {
     if (error.code === "admin_auth_required") {
       state = null;
@@ -141,6 +165,18 @@ async function loadState() {
       return;
     }
     throw error;
+  }
+}
+
+// 就绪度带实时探针（MinIO 健康端点 1.5s 超时、sing-box 端口与 PID），
+// 所以它独立于 /api/admin/state 取，失败时置 null——渲染侧把 null 当「未验证」，
+// 绝不当「已就绪」。这是整个 C 的前提：未知不等于良好。
+async function loadSetupReadiness() {
+  try {
+    setupReadiness = await api("/api/admin/setup");
+  } catch (error) {
+    if (error.code === "admin_auth_required") throw error;
+    setupReadiness = null;
   }
 }
 
@@ -517,6 +553,7 @@ async function revealAndCopyDeviceVlessUri(button, device, clientName) {
 }
 
 async function createClaim() {
+  clearClaimResult();
   const targetDevice = findDeviceByName(fields.deviceName.value);
   if (targetDevice?.enabled === false) {
     const message = `${targetDevice.clientName} 已停用。请先在设备列表中重新启用，再生成 SyncKey。`;
@@ -576,6 +613,39 @@ async function createClaim() {
   await renderLatestSingboxConfigPreview();
 }
 
+async function createDevice() {
+  const clientName = fields.newDeviceName.value.trim();
+  if (!clientName) {
+    setAction("请填写设备名。", "warn");
+    return;
+  }
+  const existing = findDeviceByName(clientName);
+  if (existing) {
+    // createManagedUser is idempotent on clientName: it would return the existing
+    // device and report success. Say so instead of implying a new device appeared.
+    setAction(`${clientName} 已存在，未创建新设备。请换一个设备名。`, "warn");
+    return;
+  }
+  const bucketName = fields.newDeviceBucket.value;
+  const result = await runAction(
+    "正在创建设备...",
+    `设备 ${clientName} 已创建。下一步：生成 SyncKey 后才能在客户端导入。`,
+    () => api("/api/admin/users/create", {
+      clientName,
+      ...(bucketName ? { bucketName } : {})
+    })
+  );
+  if (!result) return;
+  state = result.state;
+  fields.newDeviceName.value = "";
+  // The contract's original objection to a console create button was that it
+  // strands "registered but no importable SyncKey" half-built devices. Carry the
+  // new device into the SyncKey flow so creation continues instead of dangling.
+  fields.deviceName.value = clientName;
+  renderDebugJson({ user: result.user });
+  renderState();
+}
+
 async function createSyncSpace() {
   const syncId = fields.newSyncId.value.trim();
   const ownerUserId = fields.syncSpaceOwnerSelect.value;
@@ -584,7 +654,7 @@ async function createSyncSpace() {
     return;
   }
   const result = await runAction("正在创建同步空间...", "同步空间已创建。", () =>
-    api("/api/admin/sync-spaces/create", { syncId, ownerUserId })
+    api("/api/admin/sync-spaces/create", { syncId, ownerUserId, mode: fields.newSyncSpaceMode.value })
   );
   if (!result) return;
   state = result.state;
@@ -624,8 +694,22 @@ async function copyClaim() {
     return;
   }
   try {
-    await navigator.clipboard.writeText(value);
+    await copyText(value);
     setAction("完整 SyncKey 已复制。", "good");
+  } catch {
+    setAction("复制失败，当前浏览器不允许访问剪贴板。", "bad");
+  }
+}
+
+async function copyShortClaim() {
+  const value = latestClaimShortCode;
+  if (!value) {
+    setAction("请先生成 SyncKey。");
+    return;
+  }
+  try {
+    await copyText(value);
+    setAction("短码已复制；加入时还需填写服务端地址。", "good");
   } catch {
     setAction("复制失败，当前浏览器不允许访问剪贴板。", "bad");
   }
@@ -638,11 +722,46 @@ async function copyClaimUri() {
     return;
   }
   try {
-    await navigator.clipboard.writeText(value);
+    await copyText(value);
     setAction("导入 URI 已复制。", "good");
   } catch {
     setAction("复制失败，当前浏览器不允许访问剪贴板。", "bad");
   }
+}
+
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Intranet HTTP pages are not secure contexts, so use the selected-text
+      // fallback below when the Clipboard API is absent or denied.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = String(value || "");
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) {
+    throw new Error("Clipboard copy was rejected");
+  }
+}
+
+function clearClaimResult() {
+  latestClaimTKey = "";
+  latestClaimUri = "";
+  latestClaimShortCode = "";
+  byId("claimOut").value = "";
+  byId("claimShortCode").textContent = "-";
+  byId("claimServerResult").textContent = "-";
+  byId("claimResult").hidden = true;
+  byId("profileOut").textContent = "等待新的 SyncKey 生成结果...";
 }
 
 async function loginAdmin(event) {
@@ -682,6 +801,381 @@ function logoutAdmin() {
     showAuthGate();
   } else {
     loadState().catch(() => {});
+  }
+}
+
+async function loadEnrollmentDirectories() {
+  const list = byId("enrollmentDirectoryList");
+  if (!list) return;
+  if (adminAuthEnabled && !adminToken) {
+    list.textContent = "登录管理控制台后查看已开放目录。";
+    return;
+  }
+  try {
+    const result = await api("/api/admin/enrollment/v1/directories");
+    const directories = Array.isArray(result.directories) ? result.directories : [];
+    list.replaceChildren();
+    if (directories.length === 0) {
+      list.innerHTML = '<div class="empty">尚未开放目录</div>';
+      await loadEnrollmentRelations();
+      await loadEnrollmentRequests();
+      return;
+    }
+    for (const directory of directories) {
+      const row = document.createElement("div");
+      row.className = "summary-row";
+      const name = document.createElement("span");
+      name.textContent = directory.path?.split(/[\\/]/).filter(Boolean).at(-1) || "目录";
+      const path = document.createElement("span");
+      path.className = "mono";
+      path.textContent = `${directory.path} · ${directory.status === "active" ? "已开放" : "登记待恢复"}`;
+      row.append(name, path);
+      list.append(row);
+    }
+    await loadEnrollmentRelations();
+    await loadEnrollmentRequests();
+  } catch (error) {
+    list.textContent = `目录读取失败：${formatActionError(error)}`;
+  }
+}
+
+async function loadEnrollmentRelations() {
+  const list = byId("enrollmentRelationList");
+  if (!list) return;
+  if (adminAuthEnabled && !adminToken) {
+    list.textContent = "登录管理控制台后查看设备的目录授权。";
+    return;
+  }
+  try {
+    const { relations = [] } = await api("/api/admin/enrollment/v1/relations");
+    list.replaceChildren();
+    const groups = new Map();
+    for (const relation of relations) {
+      if (!groups.has(relation.deviceId)) groups.set(relation.deviceId, []);
+      groups.get(relation.deviceId).push(relation);
+    }
+    if (!groups.size) {
+      list.innerHTML = '<div class="empty">暂无已配对设备</div>';
+      await loadEnrollmentRevocationStatus();
+      return;
+    }
+    for (const [deviceId, deviceRelations] of groups) {
+      const card = document.createElement("article");
+      card.className = "item enrollment-relation-card";
+      const heading = document.createElement("div");
+      heading.className = "device-row";
+      const label = document.createElement("strong");
+      label.textContent = `已配对设备 · ${deviceId}`;
+      const revokeDevice = document.createElement("button");
+      revokeDevice.type = "button";
+      revokeDevice.className = "danger btn-compact";
+      revokeDevice.textContent = "撤销设备授权";
+      revokeDevice.disabled = deviceRelations.every(item => item.status === "revoked");
+      revokeDevice.addEventListener("click", () => confirmEnrollmentRevocation(
+        { kind: "device", deviceId },
+        `确定撤销此设备的 ${deviceRelations.length} 个目录授权？该设备授权无法自动恢复。`
+      ));
+      heading.append(label, revokeDevice);
+      card.append(heading);
+      for (const relation of deviceRelations) {
+        const row = document.createElement("div");
+        row.className = "summary-row enrollment-relation-row";
+        const description = document.createElement("span");
+        description.textContent = `${relation.directory || relation.rootId} · ${relation.status === "active" ? "授权中" : "已撤销"}`;
+        const revokeRelation = document.createElement("button");
+        revokeRelation.type = "button";
+        revokeRelation.className = "btn-secondary btn-compact";
+        revokeRelation.textContent = "撤销此目录授权";
+        revokeRelation.disabled = relation.status !== "active";
+        revokeRelation.addEventListener("click", () => confirmEnrollmentRevocation(
+          { kind: "relation", relationId: relation.relationId },
+          `只撤销设备 ${deviceId} 对目录 ${relation.directory || relation.rootId} 的授权？其他目录授权保持不变。`
+        ));
+        row.append(description, revokeRelation);
+        card.append(row);
+      }
+      list.append(card);
+    }
+    await loadEnrollmentRevocationStatus();
+  } catch (error) {
+    list.textContent = `授权列表读取失败：${formatActionError(error)}`;
+  }
+}
+
+async function confirmEnrollmentRevocation(target, body) {
+  const confirmed = await requestConfirmation({
+    title: target.kind === "device" ? "撤销设备授权" : "撤销目录授权",
+    body,
+    submitText: "撤销"
+  });
+  if (!confirmed) return;
+  const operationId = `revop_${crypto.randomUUID().replaceAll("-", "")}`;
+  sessionStorage.setItem(enrollmentRevocationStorageKey, JSON.stringify({ operationId, target }));
+  await submitEnrollmentRevocation(operationId, target);
+}
+
+async function submitEnrollmentRevocation(operationId, target) {
+  const message = byId("enrollmentRelationMessage");
+  message.textContent = "正在撤销授权并停止相关传输...";
+  try {
+    try {
+      await api("/api/admin/enrollment/v1/revocations", { operationId, target });
+    } catch (error) {
+      if (error.status !== 503) throw error;
+    }
+    await loadEnrollmentRevocationStatus();
+    await loadEnrollmentRelations();
+  } catch (error) {
+    message.textContent = `暂时无法读取撤销状态：${formatActionError(error)}；状态已保存，可刷新后继续。`;
+  }
+}
+
+async function loadEnrollmentRevocationStatus() {
+  const raw = sessionStorage.getItem(enrollmentRevocationStorageKey);
+  if (!raw) return;
+  let saved;
+  try { saved = JSON.parse(raw); }
+  catch { sessionStorage.removeItem(enrollmentRevocationStorageKey); return; }
+  if (!saved?.operationId || !saved?.target) return;
+  const message = byId("enrollmentRelationMessage");
+  const status = await api(`/api/admin/enrollment/v1/operations/${encodeURIComponent(saved.operationId)}`);
+  const targetLabel = saved.target.kind === "device" ? "设备授权" : "目录授权";
+  message.replaceChildren();
+  const text = document.createElement("span");
+  text.textContent = status.status === "complete"
+    ? "授权已撤销，相关传输已停止"
+    : "授权已停用，正在停止传输；可点击继续";
+  message.append(text);
+  if (status.status !== "complete") {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn-secondary btn-compact";
+    retry.textContent = "继续";
+    retry.addEventListener("click", () => submitEnrollmentRevocation(saved.operationId, saved.target));
+    message.append(retry);
+  }
+}
+
+async function loadEnrollmentRequests() {
+  const list = byId("enrollmentRequestList");
+  if (!list) return;
+  if (adminAuthEnabled && !adminToken) {
+    list.textContent = "登录管理控制台后查看设备配对申请。";
+    return;
+  }
+  try {
+    // A fresh server has no enrollment catalog until its first directory is
+    // registered. Read the directory list first so this normal state does
+    // not become a scary 503 or an invented empty request result. Errors from
+    // catalog reads still reach the catch below and remain visible.
+    const { directories = [] } = await api("/api/admin/enrollment/v1/directories");
+    const activeDirectories = directories.filter(item => item.status === "active");
+    if (!activeDirectories.length) {
+      list.textContent = directories.length
+        ? "目录验证完成后，设备配对申请会显示在这里。"
+        : "开放并验证服务器目录后，设备配对申请会显示在这里。";
+      return;
+    }
+    const { requests = [] } = await api("/api/admin/enrollment/v1/requests");
+    list.replaceChildren();
+    if (!requests.length) {
+      list.innerHTML = '<div class="empty">没有待审批申请</div>';
+      return;
+    }
+    for (const request of requests) {
+      const row = document.createElement("div");
+      row.className = "summary-row";
+      const label = document.createElement("span");
+      label.textContent = `设备申请 · ${formatTime(request.createdAt)}`;
+      const controls = document.createElement("div");
+      controls.className = "actions";
+      const select = document.createElement("select");
+      select.multiple = true;
+      select.size = Math.min(Math.max(activeDirectories.length, 2), 5);
+      select.setAttribute("aria-label", "选择一个或多个授权目录");
+      select.title = "可按住 Ctrl 或 Shift 选择多个目录";
+      for (const directory of activeDirectories) {
+        const option = document.createElement("option");
+        option.value = directory.rootId;
+        option.textContent = directory.path?.split(/[\\/]/).filter(Boolean).at(-1) || "目录";
+        select.append(option);
+      }
+      select.selectedIndex = -1;
+      const issue = document.createElement("button");
+      issue.type = "button";
+      issue.className = "btn-primary btn-compact";
+      issue.textContent = "签发验证码";
+      issue.disabled = activeDirectories.length === 0;
+      issue.addEventListener("click", () => {
+        const selected = [...select.selectedOptions].filter(option => option.value);
+        if (!selected.length) {
+          byId("enrollmentIssuedCode").textContent = "请先选择至少一个要授权的服务器目录。";
+          return;
+        }
+        issueEnrollmentCode(
+          request.requestId,
+          selected.map(option => option.value),
+          selected.map(option => option.textContent.trim())
+        );
+      });
+      controls.append(select, issue);
+      row.append(label, controls);
+      list.append(row);
+    }
+  } catch (error) {
+    list.textContent = `申请读取失败：${formatActionError(error)}`;
+  }
+}
+
+async function issueEnrollmentCode(requestId, rootIds, directoryNames = []) {
+  const output = byId("enrollmentIssuedCode");
+  output.textContent = "正在签发...";
+  try {
+    const roots = Array.isArray(rootIds) ? rootIds : [rootIds];
+    const requestBody = roots.length === 1 ? { rootId: roots[0] } : { rootIds: roots };
+    const result = await api(`/api/admin/enrollment/v1/requests/${encodeURIComponent(requestId)}/issue`, requestBody);
+    if (!result.deviceEnrollmentCode
+      || (roots.length === 1 && !result.binding)
+      || (roots.length > 1 && (!Array.isArray(result.bindings) || result.bindings.length !== roots.length))) {
+      throw new Error("服务端返回的目录授权结果与所选目录数量不一致。");
+    }
+    const names = directoryNames.length ? directoryNames.join("、") : `${roots.length} 个目录`;
+    output.textContent = `已授权目录：${names}\n一次性身份验证码（请安全交付给对应设备）：${result.deviceEnrollmentCode}`;
+    await loadEnrollmentRequests();
+  } catch (error) {
+    output.textContent = `验证码未签发：${formatActionError(error)}`;
+  }
+}
+
+async function createEnrollmentChannelCode() {
+  const output = byId("enrollmentChannelCode");
+  output.textContent = "正在检查已应用的 sing-box 配置...";
+  try {
+    const result = await api("/api/admin/enrollment/v1/channel-code", {});
+    output.textContent = `接入通道码（请安全交付给设备）：${result.wrappedCode}`;
+  } catch (error) {
+    output.textContent = `通道码未生成：${formatActionError(error)}`;
+  }
+}
+
+async function reconfigureEnrollmentChannel() {
+  const button = byId("reconfigureEnrollmentChannelBtn");
+  const output = byId("enrollmentReconfigureStatus");
+  button.disabled = true;
+  try {
+    if (readinessStep("directory")?.ready !== true) {
+      output.textContent = "请先开放并验证一个服务器目录，再准备连接和通道码。";
+      return;
+    }
+    const repair = readinessStep("repair");
+    const tunnel = state?.tunnel || {};
+    const firstUse = !tunnel.lastAppliedAt;
+    // On a genuinely unconfigured install, bootstrap a REALITY profile using
+    // only the external endpoint the administrator supplied. Keep the
+    // established reconfigure/apply path for already-applied connections.
+    if (firstUse) {
+      const publicHost = byId("firstUsePublicHost").value.trim();
+      const publicPort = Number(byId("firstUsePublicPort").value);
+      if (!publicHost || !Number.isInteger(publicPort) || publicPort < 1 || publicPort > 65535) {
+        output.textContent = "首次连接需要填写外部访问地址和 1–65535 之间的端口。";
+        return;
+      }
+      output.textContent = "正在准备并应用连接设置...";
+      await api("/api/admin/tunnel/autofill", {
+        protocol: "vless-reality-tcp",
+        publicHost,
+        publicPort,
+        listenPort: Number(tunnel.listenPort || publicPort),
+        remark: "sfsc-home",
+        forceRealityKeys: false
+      });
+      const applied = await api("/api/admin/singbox/apply", { confirmApplySingbox: true }, { timeoutMs: 0 });
+      if (applied?.state?.tunnel?.restartRequired) {
+        throw new Error("服务端没有确认连接设置已生效，通道码未签发。");
+      }
+      state = applied.state;
+      await loadSetupReadiness();
+      renderState();
+    }
+    let operation;
+    try {
+      operation = JSON.parse(localStorage.getItem(enrollmentReconfigureStorageKey) || "null");
+    } catch {
+      localStorage.removeItem(enrollmentReconfigureStorageKey);
+      operation = null;
+    }
+    const requestedHost = (firstUse ? byId("firstUsePublicHost").value : fields.publicHost.value).trim();
+    const requestedPort = Number(firstUse ? byId("firstUsePublicPort").value : fields.publicPort.value);
+    if (operation && typeof operation.operationId === "string"
+      && (operation.publicHost !== requestedHost || operation.publicPort !== requestedPort)) {
+      let previous;
+      try {
+        previous = await api(`/api/admin/enrollment/v1/reconfigure/${encodeURIComponent(operation.operationId)}`);
+      } catch (error) {
+      output.textContent = `上一次连接设置的状态尚未确认，请先刷新或点击继续；新的地址尚未应用：${formatActionError(error)}`;
+        return;
+      }
+      if (!(["complete", "rolled-back"].includes(previous.stage))) {
+        output.textContent = "上一次连接设置仍在处理中，请先使用原地址继续；新的地址尚未应用。";
+        return;
+      }
+      localStorage.removeItem(enrollmentReconfigureStorageKey);
+      operation = null;
+    }
+    if (!operation || typeof operation.operationId !== "string") {
+      const random = crypto.getRandomValues(new Uint8Array(16));
+      const operationId = `op_${Array.from(random, value => value.toString(16).padStart(2, "0")).join("")}`;
+      operation = {
+        operationId,
+        ...(requestedHost ? { publicHost: requestedHost } : {}),
+        ...(Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65535 ? { publicPort: requestedPort } : {})
+      };
+      localStorage.setItem(enrollmentReconfigureStorageKey, JSON.stringify(operation));
+    }
+    output.textContent = "正在应用连接设置并生成通道码...";
+    const result = await api("/api/admin/enrollment/v1/reconfigure", operation, { timeoutMs: 0 });
+    if (result.stage === "complete" && result.wrappedCode) {
+      output.textContent = `连接设置已应用，通道码已生成（请安全交付给设备；外部连接仍需设备实际验证）：${result.wrappedCode}`;
+      localStorage.removeItem(enrollmentReconfigureStorageKey);
+      return;
+    }
+    if (result.stage === "rolled-back") {
+      output.textContent = "连接设置失败，已恢复原配置；未生成通道码。可检查原因后重试。";
+      localStorage.removeItem(enrollmentReconfigureStorageKey);
+      return;
+    }
+    if (result.stage === "repair-needed") {
+      output.textContent = "连接设置未完成，服务端需要管理员检查和修复；未生成通道码。";
+      return;
+    }
+    output.textContent = "连接设置正在恢复中；未生成通道码。点击继续可查询进度。";
+  } catch (error) {
+    output.textContent = `连接设置状态尚未确认；状态已保存，可刷新后继续：${formatActionError(error)}`;
+  } finally {
+    button.disabled = false;
+    loadState().catch(() => {});
+  }
+}
+
+async function openEnrollmentDirectory() {
+  const path = byId("enrollmentDirectoryPath").value.trim();
+  const message = byId("enrollmentDirectoryMessage");
+  if (!path) {
+    message.textContent = "请输入服务器上已存在的目录路径。";
+    return;
+  }
+  const button = byId("openEnrollmentDirectoryBtn");
+  button.disabled = true;
+  message.textContent = "正在校验并登记目录...";
+  try {
+    const result = await api("/api/admin/enrollment/v1/directories", { path });
+    message.textContent = `目录已开放：${result.directory.path}`;
+    byId("enrollmentDirectoryPath").value = "";
+    await loadState();
+  } catch (error) {
+    message.textContent = `目录未开放：${formatActionError(error)}`;
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -796,9 +1290,76 @@ function formatError(error) {
     claim_redeem_failed: "客户端兑换 SyncKey 失败，请检查服务地址和网络。",
     client_error: "客户端发生未知错误，请查看客户端诊断包。",
     client_port_in_use: "客户端本地端口被占用，请关闭重复实例后重试。",
+    connection_repair_busy: "同步或另一项连接修复正在进行，请稍后重试。",
+    connection_repair_cleanup_failed: "修复探测未确认清理完成，不能视为修复成功。",
+    connection_repair_invalid: "连接修复请求无效，请刷新页面后重试。",
+    connection_repair_list_failed: "无法检查连接修复目标，请检查服务端状态。",
+    connection_repair_probe_conflict: "无法确认探测路径属于本次修复，未修改文件。",
+    connection_repair_read_failed: "无法读取连接修复目标，请检查服务端状态。",
+    connection_repair_write_failed: "无法更新连接修复目标，请检查服务端状态。",
     danger_confirmation_required: "请按提示完成二次确认后再继续。",
+    data_authorization_invalid: "签名目录授权无效，请重新检查服务器通道和授权状态。",
+    data_authorization_mismatch: "签名目录授权与当前设备或关系不匹配，请管理员核对目录授权。",
+    data_authorization_trust_failed: "目录授权签名未通过已 pin 的服务器密钥验证，请核对服务器信任信息。",
     device_disabled: "该设备已被停用，请在服务端重新启用后再继续。",
     device_not_found: "当前客户端未在服务端登记，请重新生成并导入 SyncKey。",
+    enrollment_auth_invalid: "身份验证码签名无效，请重新发起申请并联系管理员。",
+    enrollment_auth_capacity: "身份验证请求过多，请稍后重试。",
+    enrollment_auth_expired: "服务器与电脑的系统时间可能存在较大差异。请先检查本机 Windows 日期、时间和时区，并尝试立即同步；若本机时间正确，再请管理员检查服务器时间。无需重新配对、重新导入通道码或重新签发身份验证码。",
+    enrollment_auth_replayed: "该身份验证请求已使用，请重新发起申请。",
+    enrollment_binding_mismatch: "身份申请与授权目录不匹配，请联系管理员重新签发。",
+    enrollment_catalog_not_ready: "身份接入目录尚未就绪，请检查服务端设置。",
+    enrollment_channel_invalid: "客户端尚未导入有效的通道配置码。",
+    enrollment_channel_mismatch: "通道配置与身份申请不匹配，请重新导入管理员提供的通道配置码。",
+    enrollment_channel_stale: "设备请求的接入通道已更新，请重新导入管理员提供的新通道码。",
+    enrollment_channel_not_ready: "服务端身份接入通道尚未就绪，请检查连接地址、端口和通道设置后重试。",
+    enrollment_channel_expired: "通道配置已过期，请重新复制管理员提供的通道配置码。",
+    enrollment_code_expired: "身份验证码已过期，请管理员重新签发。",
+    enrollment_code_invalid: "身份验证码无效或不属于当前申请，请核对申请后联系管理员。",
+    enrollment_code_used: "身份验证码已使用，请重新发起身份申请。",
+    enrollment_device_revoked: "该客户端身份已撤销，请联系管理员。",
+    enrollment_data_authorization_denied: "设备没有该同步关系的数据访问授权，请联系管理员检查目录绑定。",
+    enrollment_data_channel_not_ready: "服务端数据通道尚未完成配置或应用，请管理员检查隧道状态。",
+    enrollment_data_relation_not_ready: "服务端受保护目录关系尚未运行，请管理员检查服务状态。",
+    enrollment_data_relation_start_failed: "无法启动服务端受保护目录关系，请管理员检查防护能力和运行日志。",
+    enrollment_endpoint_invalid: "身份接入地址无效，请重新导入管理员提供的通道配置码。",
+    enrollment_identity_conflict: "客户端身份与服务端已登记身份冲突，请联系管理员处理。",
+    enrollment_identity_missing: "本地设备身份文件缺失或损坏，请先修复本地状态。",
+    enrollment_proxy_unavailable: "首次接入隧道不可用，请检查客户端 sing-box 组件和网络。",
+    enrollment_public_key_mismatch: "身份公钥与服务端登记不一致，请联系管理员核对。",
+    enrollment_relation_conflict: "同步关系与当前授权冲突，请联系管理员核对目录绑定。",
+    enrollment_relation_denied: "该客户端没有同步关系授权，请联系管理员授予目录权限。",
+    enrollment_relation_revoked: "该同步关系已撤销，请联系管理员。",
+    enrollment_revocation_identity_conflict: "撤销期间设备授权发生变化，请管理员检查服务端状态。",
+    enrollment_revocation_incomplete: "授权撤销尚未完成，请刷新状态后继续。",
+    enrollment_revocation_invalid: "撤销请求无效，请检查所选设备或目录。",
+    enrollment_revocation_operation_conflict: "该撤销请求与之前保存的目标不一致，请刷新后重试。",
+    enrollment_revocation_operation_not_found: "找不到已保存的撤销状态，请刷新后重试。",
+    enrollment_revocation_not_ready: "关系服务尚未就绪，撤销尚未开始。",
+    enrollment_revocation_overlay_not_applied: "撤销后的数据配置尚未确认应用。",
+    enrollment_revocation_recovery_pending: "撤销恢复尚未完成，暂时不能申请数据授权。",
+    sftp_access_marker_conflict: "本机或远端访问标记与当前授权根目录冲突；拒绝覆盖，请核对原同步目录。",
+    sftp_access_marker_invalid: "SFTP 访问标记输入无效，或缺少已验证的根目录标识。",
+    sftp_access_marker_missing: "已初始化关系的本机或远端访问标记缺失；拒绝重建或继续。",
+    sftp_access_marker_write_failed: "无法确认 SFTP 访问标记写入结果；请核对本机或远端目录后重试。",
+    enrollment_request_exists: "该身份申请已存在，请查看当前申请状态。",
+    enrollment_request_invalid: "身份申请内容无效，请重新发起申请。",
+    enrollment_request_mismatch: "身份验证码不属于当前设备或申请，请核对后重试。",
+    enrollment_request_not_found: "服务端找不到该身份申请，请重新发起申请。",
+    enrollment_reconfigure_busy: "另一个隧道或数据通道操作正在进行，请稍后重试。",
+    enrollment_reconfigure_conflict: "该连接设置请求与之前保存的信息不一致，请重新开始操作。",
+    enrollment_reconfigure_invalid: "重配置请求无效，请检查公网地址和端口。",
+    enrollment_reconfigure_needs_repair: "重配置需要管理员修复；服务端未签发通道码。",
+    enrollment_reconfigure_not_found: "找不到已保存的连接设置，请重新检查后重试。",
+    enrollment_reconfigure_state_invalid: "重配置记录无效，请管理员检查服务端状态。",
+    enrollment_reconfigure_write_failed: "重配置记录无法保存，请管理员检查数据目录。",
+    enrollment_response_invalid: "身份接入响应无效，请检查服务端版本和日志。",
+    enrollment_signer_invalid: "服务端身份签名组件不可用，请检查服务端配置。",
+    enrollment_state_invalid: "服务端身份状态损坏，请先备份并修复服务端状态。",
+    enrollment_state_conflict: "身份状态已变化，请刷新后重试。",
+    enrollment_transport_failed: "首次接入隧道连接失败，请检查客户端网络和服务端状态。",
+    enrollment_trust_failed: "服务端密钥或身份回执签名校验失败，请与管理员核对服务器指纹。",
+    enrollment_trust_verifier_required: "缺少独立的服务端密钥 pin，无法验证身份通道。",
     heartbeat_auth_invalid: "客户端心跳签名无效，请重新导入 SyncKey。",
     heartbeat_auth_required: "客户端心跳缺少签名，请重新导入 SyncKey。",
     heartbeat_rate_limited: "该来源心跳失败次数过多，服务端已临时限速，请稍后再试。",
@@ -807,6 +1368,47 @@ function formatError(error) {
     import_code_invalid: "SyncKey 格式不正确，请重新复制。",
     invalid_json: "请求内容不是合法 JSON，请刷新页面后重试。",
     invalid_path: "请求的资源路径非法，请刷新页面后重试。",
+    sync_recovery_preflight_failed: "同步前无法完成恢复区检查，当前未执行同步。",
+    sync_recovery_restore_hash_mismatch: "恢复文件校验不一致，未写入目标文件。",
+    sync_recovery_restore_preview_expired: "还原预览已过期，请重新预览。",
+    sync_recovery_restore_preview_required: "需要先预览当前还原操作。",
+    sync_recovery_restore_staging_invalid: "受保护的还原暂存区无效，未写入目标文件。",
+    sync_recovery_restore_target_exists: "还原目标已经存在，未覆盖现有文件。",
+    sync_recovery_restore_target_invalid: "还原目标必须位于本地同步文件夹内。",
+    first_sync_conflict_command_failed: "首次冲突保护操作失败；未执行初始化。请检查服务端状态后重新预览。",
+    first_sync_conflict_preview_expired: "首次冲突预览已过期；未执行初始化。请重新扫描并复核冲突。",
+    first_sync_conflict_preview_required: "初始化前必须先完成首次冲突预览。",
+    first_sync_conflict_review_required: "首次冲突保护需要人工复核；未执行初始化。请检查目录和未完成操作后重试。",
+    first_sync_conflict_save_required: "初始化前必须先预览并保存双方版本。",
+    first_sync_conflict_set_changed: "预览后文件发生变化。未执行初始化，请重新预览并保存当前冲突双方版本。",
+    first_sync_conflict_source_changed: "冲突来源文件已变化；未执行初始化。请重新扫描并复核双方版本。",
+    first_sync_conflict_stage_invalid: "首次冲突保护暂存区无效；未执行初始化，请联系管理员检查服务端状态。",
+    first_sync_conflict_target_exists: "恢复目标已存在；未覆盖现有文件，也未执行初始化。",
+    first_sync_conflict_target_invalid: "冲突恢复目标路径无效；未执行初始化，请重新选择目录。",
+    first_sync_conflict_trusted_relation_required: "首次冲突扫描缺少可信目录授权关系；未执行初始化，请检查任务授权和目录选择。",
+    first_sync_conflict_scan_failed: "首次冲突扫描失败；未执行初始化。请检查通道连接与目录权限后重试。",
+    first_sync_conflict_staging_invalid: "首次冲突保护暂存内容无效；未执行初始化，请联系管理员检查服务端状态。",
+    sync_recovery_review_required: "恢复区或双向同步基准需要人工核对；本次未执行同步。",
+    sync_recovery_trusted_relation_required: "当前任务没有可验证的目录授权关系，不能使用恢复功能。",
+    sync_recovery_version_not_found: "找不到这份已保存版本，或它尚未完成。",
+    directory_root_input_invalid: "目录路径无效，请输入服务器上已存在的目录。",
+    directory_root_io_failed: "服务器无法完成目录检查，请检查服务端日志和文件系统状态。",
+    directory_root_link_denied: "不允许通过符号链接登记目录，请选择真实目录路径。",
+    directory_root_missing: "服务器上找不到所选目录，请核对路径。",
+    directory_root_marker_collision: "所选目录已有 Syncraft 或未知标记，未覆盖；请人工核查。",
+    directory_root_marker_mismatch: "目录标记内容与登记记录不符，未覆盖；请人工核查。",
+    directory_root_marker_missing: "目录标记已丢失，请人工核查后重试。",
+    directory_root_registration_review_required: "目录登记状态需要人工核查，未覆盖现有文件。",
+    directory_root_mount_changed: "目录所在文件系统已变化，请重新检查路径后重试。",
+    directory_root_overlap: "所选目录与已开放目录相互包含，请选择完全独立的目录。",
+    directory_root_mount_unavailable: "无法验证目录所在文件系统，请检查服务器运行环境。",
+    directory_root_not_ready: "目录尚未完成登记，请重试或检查服务端状态。",
+    directory_root_permission_denied: "服务端没有读取或写入所选目录的权限。",
+    directory_root_record_invalid: "目录登记记录无效，请备份后人工核查。",
+    directory_root_registration_incomplete: "目录登记未完成，可刷新状态后重试。",
+    directory_root_replaced: "所选路径已指向另一个目录，请人工核查。",
+    directory_root_space_insufficient: "所选目录可用空间不足。",
+    directory_root_space_unavailable: "无法读取所选目录的可用空间。",
     invalid_vless_uri: "VLESS 链接格式不正确，请检查参数。",
     last_active_bucket_disable_blocked: "至少需要保留一个启用的同步仓库。",
     last_bucket_delete_blocked: "至少需要保留一个同步仓库。",
@@ -838,6 +1440,10 @@ function formatError(error) {
     singbox_start_failed: "客户端隧道启动失败，请查看客户端诊断日志。",
     storage_request_failed: "存储服务请求失败，请检查 MinIO、地址和密钥。",
     sync_already_running: "客户端已有其他同步任务正在运行，请等待完成后再启动这个任务。",
+    sync_id_unavailable: "这个同步空间名称已被占用，请换一个。",
+    sync_space_access_denied: "这台设备没有该同步空间的授权，请先把它加入空间。",
+    sync_space_membership_exists: "这台设备已经是该同步空间的成员。",
+    sync_space_role_not_allowed: "备份用途的同步空间不接受只读成员，请改用分发用途，或把角色设为可写。",
     request_timeout: "请求服务超时，请稍后重试。",
     unsupported_media_type: "请求内容类型不受支持，请刷新页面后重试。",
     unsupported_profile_version: "当前客户端不支持这个配置版本，请升级客户端。",
@@ -1154,8 +1760,62 @@ function setConfirmMessage(message) {
   target.textContent = message || "";
 }
 
+// 取一步的就绪信息。拿不到就绪度时返回 null，调用方据此显示「未验证」。
+function readinessStep(id) {
+  const steps = Array.isArray(setupReadiness?.steps) ? setupReadiness.steps : [];
+  return steps.find((step) => step.id === id) || null;
+}
+
+function renderSetupReadiness() {
+  const navItem = byId("setupNavItem");
+  const panel = byId("tab-setup");
+  const complete = setupReadiness?.complete === true;
+  // 全部就绪后收起入口：向导长期驻留会在日常运维界面留下一个永远绿的装饰。
+  // 取不到就绪度时保持显示——那种情况更需要管理员看到检测失败。
+  if (navItem) navItem.hidden = complete;
+  if (panel && complete && panel.classList.contains("active")) {
+    switchTab("tab-overview");
+  }
+
+  const steps = Array.isArray(setupReadiness?.steps) ? setupReadiness.steps : [];
+  const progress = byId("setupProgress");
+  if (progress) {
+    if (!setupReadiness) {
+      progress.textContent = "拿不到就绪检测结果，请确认服务端在运行后重新检测。";
+    } else {
+      const readyCount = steps.filter((step) => step.ready).length;
+      progress.textContent = complete
+        ? `目录、连接设置和设备配对均已就绪。`
+        : `已完成 ${readyCount} / ${steps.length} 步，当前应处理：${steps.find((step) => step.id === setupReadiness.currentStepId)?.title || "未知"}。`;
+    }
+  }
+
+  const list = byId("setupStepList");
+  if (!list) return;
+  if (!steps.length) {
+    list.innerHTML = `<div class="notice warning"><strong>就绪状态未验证</strong><span>没有拿到检测结果，界面不会据此判断是否配置完成。</span></div>`;
+    return;
+  }
+  list.innerHTML = steps.map((step, index) => {
+    const tone = step.ready ? "good" : step.blocked ? "" : "warn";
+    const stateText = step.ready ? "已就绪" : step.blocked ? "待前置步骤" : "待处理";
+    return `
+      <div class="notice ${step.ready ? "success" : step.blocked ? "" : "warning"}">
+        <strong>${index + 1}. ${escapeHtml(step.title)} <span class="pill ${tone}">${escapeHtml(stateText)}</span></strong>
+        <span>${escapeHtml(step.ready ? step.hint : step.blockedReason || step.hint)}</span>
+        ${step.ready ? "" : `<span><button class="btn-secondary btn-compact" type="button" data-tab-target="${escapeHtml(setupStepTab(step.id))}">前往</button></span>`}
+      </div>`;
+  }).join("");
+}
+
+// 普通目录、修复与配对工作流都从首页进入；隧道细节留在高级设置。
+function setupStepTab(id) {
+  return { directory: "tab-overview", repair: "tab-overview", pairing: "tab-overview" }[id] || "tab-overview";
+}
+
 function renderState() {
   if (!state) return;
+  renderSetupReadiness();
   renderStatStrip();
   renderOverview();
   renderVless();
@@ -1200,7 +1860,6 @@ function toggleConfigPreview() {
 }
 
 function renderStatStrip() {
-  const tunnel = state.tunnel || {};
   const devices = Array.isArray(state.devices) ? state.devices : [];
   const enabledDevices = devices.filter((device) => device.enabled !== false);
   const onlineDevices = enabledDevices.filter((device) => device.online);
@@ -1208,13 +1867,12 @@ function renderStatStrip() {
     const syncState = currentDeviceSyncState(device);
     return syncState === "syncing" || syncState === "running";
   });
-  const buckets = Array.isArray(state.storage?.buckets) ? state.storage.buckets : [];
-  const totalBytes = buckets.reduce((sum, bucket) => sum + (Number(bucket.sizeBytes) || 0), 0);
-
-  setStatValue("statTunnelValue", tunnel.restartRequired ? "待重启" : tunnel.protocol ? "已配置" : "未配置", tunnel.restartRequired ? "warn" : "ok");
-  setStatText("statTunnelSub", tunnel.protocol
-    ? `${tunnel.protocol}${tunnel.publicPort ? ` · :${tunnel.publicPort}` : ""}`
-    : "尚未生成隧道配置");
+  const directory = readinessStep("directory");
+  const pairing = readinessStep("pairing");
+  const directoryCount = Number(directory?.evidence?.activeRootCount) || 0;
+  const authorizedRelationCount = Number(pairing?.evidence?.authorizedRelationCount) || 0;
+  setStatValue("statDirectoryValue", directory ? String(directoryCount) : "未验证", directoryCount ? "ok" : "warn");
+  setStatText("statDirectorySub", directory?.ready ? "目录标记与访问检查通过" : directory?.blockedReason || "目录检查结果未取得");
   setStatValue("statOnlineDevicesValue", `${onlineDevices.length} / ${enabledDevices.length}`, onlineDevices.length ? "ok" : "warn");
   setStatText("statOnlineDevicesSub", enabledDevices.length
     ? `${Math.max(enabledDevices.length - onlineDevices.length, 0)} 台离线`
@@ -1223,29 +1881,31 @@ function renderStatStrip() {
   setStatText("statSyncingSub", syncingDevices.length
     ? syncingDevices.map((device) => device.clientName || device.name || device.id || "未知设备").slice(0, 2).join("、")
     : "暂无同步任务");
-  setStatValue("statStorageUsageValue", totalBytes > 0 ? formatStorageBytes(totalBytes) : `${buckets.length} 个仓库`, buckets.length ? "ok" : "warn");
-  setStatText("statStorageUsageSub", buckets.length
-    ? `${buckets.filter((bucket) => !bucket.disabledAt).length} 个启用仓库`
-    : "暂无仓库状态");
+  setStatValue("statAuthorizedRelationValue", pairing ? String(authorizedRelationCount) : "未验证", authorizedRelationCount ? "ok" : "warn");
+  setStatText("statAuthorizedRelationSub", pairing?.ready ? "已签名授权并绑定已验证目录" : pairing?.blockedReason || "授权检查结果未取得");
 }
 
 function renderOverview() {
-  const tunnel = state?.tunnel || {};
-  const storage = state?.storage || {};
+  // 这里刻意不再从 state.tunnel / state.storage 读任何东西：概览的配置类灯与
+  // 待处理项全部改由就绪度提供。把那两个变量留在作用域里，等于给「顺手用
+  // tunnel.protocol 判断一下」留好了入口，而那正是本轮要消除的缺陷。
   const devices = Array.isArray(state?.devices) ? state.devices : [];
   const enabledDevices = devices.filter((device) => device.enabled !== false);
-  const buckets = Array.isArray(storage.buckets) ? storage.buckets : [];
-  const activeBuckets = buckets.filter((bucket) => !bucket.disabledAt);
   const issues = [];
 
-  if (tunnel.restartRequired) {
-    issues.push({ level: "warning", title: "配置修改尚未应用", detail: "sing-box 仍在使用上一版配置，请到基础设置执行“重启并应用”。" });
+  // 首次配置未完成时，它是唯一值得说的事：底下那些「离线/失败」条目在
+  // 配置本身没完成时全是噪音。旧实现没有「你还没配置完」这个概念，
+  // 于是零配置部署的概览显示「无待处理项」。
+  if (setupReadiness && setupReadiness.complete === false) {
+    const current = setupReadiness.steps.find((step) => step.id === setupReadiness.currentStepId);
+    issues.push({
+      level: "warning",
+      title: "首次配置尚未完成",
+      detail: current ? `下一步：${current.title}。${current.blockedReason || current.hint}` : "打开首次配置面板查看剩余步骤。"
+    });
   }
-  if (!tunnel.protocol) {
-    issues.push({ level: "warning", title: "VLESS 尚未配置", detail: "生成隧道配置后，客户端才能建立同步连接。" });
-  }
-  if (!activeBuckets.length) {
-    issues.push({ level: "danger", title: "没有可用同步仓库", detail: "检查 MinIO 连接并至少启用一个同步仓库。" });
+  if (!setupReadiness) {
+    issues.push({ level: "warning", title: "就绪状态未验证", detail: "拿不到就绪检测结果，界面不会据此判断配置是否完成。" });
   }
   const offlineCount = enabledDevices.filter((device) => !device.online).length;
   if (offlineCount) {
@@ -1267,11 +1927,13 @@ function renderOverview() {
     ? issues.slice(0, 4).map((issue) => `<div class="notice ${issue.level}"><strong>${escapeHtml(issue.title)}</strong><span>${escapeHtml(issue.detail)}</span></div>`).join("")
     : `<div class="notice success"><strong>无待处理项</strong></div>`;
 
-  setOverviewStatus("overviewServiceState", true, "API 与管理状态可达");
-  setOverviewStatus("overviewTunnelState", Boolean(tunnel.protocol) && !tunnel.restartRequired, tunnel.restartRequired ? "待重启应用" : tunnel.protocol ? "已配置并应用" : "尚未配置");
-  setOverviewStatus("overviewStorageState", activeBuckets.length > 0, activeBuckets.length ? `${activeBuckets.length} 个仓库可用` : "没有可用仓库");
-  const protocolCount = Object.keys(state?.diagnostics?.protocols || {}).length;
-  setOverviewStatus("overviewProtocolState", protocolCount > 0, protocolCount ? `${protocolCount} 项协议已报告` : "协议摘要缺失");
+  const directoryStep = readinessStep("directory");
+  const repairStep = readinessStep("repair");
+  const pairingStep = readinessStep("pairing");
+  setOverviewStatus("overviewServiceState", Boolean(setupReadiness), setupReadiness ? "API 与管理状态可达" : "就绪检测未返回");
+  setOverviewStatus("overviewTunnelState", directoryStep?.ready === true, directoryStep ? (directoryStep.ready ? `${directoryStep.evidence.activeRootCount} 个目录已实测` : directoryStep.blockedReason) : "未验证");
+  setOverviewStatus("overviewStorageState", repairStep?.ready === true, repairStep ? (repairStep.ready ? "已应用" : repairStep.blockedReason) : "未验证");
+  setOverviewStatus("overviewProtocolState", pairingStep?.ready === true, pairingStep ? (pairingStep.ready ? `${pairingStep.evidence.authorizedRelationCount} 个有效关系` : pairingStep.blockedReason) : "未验证");
 
   const recent = [...devices].sort((left, right) => String(right.lastSeenAt || "").localeCompare(String(left.lastSeenAt || ""))).slice(0, 5);
   byId("overviewDeviceList").innerHTML = recent.length ? `
@@ -1282,7 +1944,7 @@ function renderOverview() {
         <span class="pill ${device.enabled === false ? "warn" : device.online ? "good" : ""}">${device.enabled === false ? "停用" : device.online ? "在线" : "离线"}</span>
         <span class="overview-device-meta">${escapeHtml(formatSyncState(currentDeviceSyncState(device)))}</span>
         <span class="overview-device-meta">${escapeHtml(formatTime(device.lastSeenAt))}</span>
-      </div>`).join("")}` : `<div class="empty">暂无设备，先签发一个设备 SyncKey。</div>`;
+      </div>`).join("")}` : `<div class="empty">暂无设备；先开放目录，再批准设备配对申请。</div>`;
 }
 
 function setOverviewStatus(id, ok, text) {
@@ -1329,6 +1991,8 @@ function renderApplyNotice() {
 
 function renderVless() {
   const tunnel = state.tunnel;
+  const firstUseInputs = byId("firstUseConnectionInputs");
+  if (firstUseInputs) firstUseInputs.hidden = Boolean(tunnel.lastAppliedAt);
   fields.protocol.value = tunnel.protocol;
   fields.remark.value = tunnel.remark || "sfsc-home";
   fields.publicHost.value = tunnel.publicHost;
@@ -1341,6 +2005,10 @@ function renderVless() {
   fields.realityPrivateKey.value = "";
   fields.realityPrivateKey.placeholder = tunnel.reality?.privateKey ? "已保存，留空保持不变" : "";
   fields.realityShortId.value = tunnel.reality?.shortId || "";
+  if (tunnel.lastAppliedAt) {
+    if (!byId("firstUsePublicHost").value) byId("firstUsePublicHost").value = tunnel.publicHost || "";
+    if (!byId("firstUsePublicPort").value) byId("firstUsePublicPort").value = tunnel.publicPort || "";
+  }
 
   byId("tunnelOut").textContent = [
     `协议: ${tunnel.protocol}`,
@@ -1378,6 +2046,16 @@ function renderStorage() {
     ? current
     : activeBuckets[0]?.name || "";
 
+  const currentNewDeviceBucket = fields.newDeviceBucket.value || storage.bucket;
+  fields.newDeviceBucket.innerHTML = activeBuckets.length
+    ? activeBuckets.map((bucket) =>
+      `<option value="${escapeHtml(bucket.name)}">${escapeHtml(bucket.name)}</option>`
+    ).join("")
+    : `<option value="">先创建仓库</option>`;
+  fields.newDeviceBucket.value = activeBuckets.some((bucket) => bucket.name === currentNewDeviceBucket)
+    ? currentNewDeviceBucket
+    : activeBuckets[0]?.name || "";
+
   byId("bucketList").innerHTML = storage.buckets.length ? storage.buckets.map((bucket) =>
     renderBucketItem(bucket, storage.buckets, activeBuckets)
   ).join("") : `<div class="empty">暂无仓库</div>`;
@@ -1392,10 +2070,18 @@ function renderSyncSpaces() {
     ? devices.map((device) => `<option value="${escapeHtml(device.id)}">${escapeHtml(device.clientName)}</option>`).join("")
     : `<option value="">先创建设备</option>`;
   fields.syncSpaceOwnerSelect.value = devices.some((device) => device.id === selectedOwner) ? selectedOwner : devices[0]?.id || "";
-  fields.syncSpaceSelect.innerHTML = `<option value="">设备私有空间</option>${spaces.map((space) =>
-    `<option value="${escapeHtml(space.id)}">${escapeHtml(space.syncId)} · ${escapeHtml(space.memberCount)} 个成员</option>`
+  // 私有空间也是一个有真实 syncId 的同步空间，不是「没有空间」这个替代项。
+  // 空值的含义是「这台设备用它自己的私有空间」，措辞必须仍然落在「同步空间」这个词上。
+  fields.syncSpaceSelect.innerHTML = `<option value="">这台设备的私有同步空间</option>${spaces.map((space) =>
+    `<option value="${escapeHtml(space.id)}">${escapeHtml(space.syncId)} · ${escapeHtml(formatSyncSpaceMode(space.mode))} · ${escapeHtml(space.memberCount)} 个成员</option>`
   ).join("")}`;
   fields.syncSpaceSelect.value = spaces.some((space) => space.id === selectedSpace) ? selectedSpace : "";
+}
+
+// 与客户端 app.js 的同名函数保持同一张对照表：同一个空间在两个界面必须用同一个词
+// 描述自己的用途，否则管理员看到的「分发」和用户看到的说法会对不上。
+function formatSyncSpaceMode(mode) {
+  return { backup: "备份", distribution: "分发", collaboration: "协作" }[mode] || "未知";
 }
 
 function renderBucketItem(bucket, buckets = [], activeBuckets = []) {
@@ -1575,6 +2261,7 @@ function renderClaimResult(result = {}) {
   byId("claimShortCode").textContent = result.code || claim.code || latestClaimShortCode || "-";
   byId("claimDevice").textContent = claim.clientName || result.profile?.clientName || fields.deviceName.value || "-";
   byId("claimBucket").textContent = claim.bucketName || result.profile?.storage?.bucket || fields.bucketSelect.value || "-";
+  byId("claimServerResult").textContent = claim.server || fields.claimServer.value || "-";
   byId("claimExpiry").textContent = formatExpiry(claim.expiresAt);
 }
 
@@ -1838,7 +2525,7 @@ function formatConflictSummary(conflicts = {}) {
 
 function formatRuntimeDiagnostics(diagnostics = {}) {
   const version = diagnostics.version || "-";
-  return `服务端 ${version} · ${formatProtocolVersions(diagnostics.protocols)}`;
+  return `服务端版本 ${version}`;
 }
 
 function formatProtocolVersions(protocols = {}) {
